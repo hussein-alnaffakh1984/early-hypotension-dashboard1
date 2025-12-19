@@ -1,58 +1,38 @@
 import numpy as np
+import pandas as pd
 
-def generate_alarm(risk_score: float, threshold: float) -> bool:
-    try:
-        return float(risk_score) >= float(threshold)
-    except Exception:
-        return False
+def alarm_from_score(score: float, threshold: float) -> bool:
+    return float(score) >= float(threshold)
 
-def classify_drop_type(map_values: np.ndarray, time_values: np.ndarray) -> str:
+def classify_drop_type(df: pd.DataFrame, map_col="MAP") -> str:
     """
-    Auto classify hypotension pattern:
-    A: Rapid (steep drop in short time)
-    B: Gradual (slow consistent downward trend)
-    C: Intermittent (zig-zag / oscillation with drops)
+    تصنيف بسيط من سلسلة MAP:
+    A Rapid: هبوط سريع (فرق كبير خلال نافذة قصيرة)
+    B Gradual: هبوط تدريجي (انحدار مستمر)
+    C Intermittent: متقطع (ذبذبة/نمط صعود وهبوط)
     """
-    y = np.asarray(map_values, dtype=float)
-    t = np.asarray(time_values, dtype=float)
+    if map_col not in df.columns or len(df) < 6:
+        return "Unknown"
 
-    if len(y) < 6:
-        return "B"  # default
+    x = pd.to_numeric(df[map_col], errors="coerce").fillna(method="ffill").fillna(0.0).to_numpy()
 
-    # remove non-finite
-    mask = np.isfinite(y) & np.isfinite(t)
-    y = y[mask]
-    t = t[mask]
-    if len(y) < 6:
-        return "B"
+    # compute rough changes
+    d1 = np.diff(x)
+    if len(d1) == 0:
+        return "Unknown"
 
-    # compute slopes
-    dt = np.diff(t)
-    dy = np.diff(y)
-    dt[dt == 0] = 1e-6
-    slope = dy / dt  # MAP units per second
+    # rapid drop: any big negative jump
+    if np.min(d1) <= -8:
+        return "A: Rapid"
 
-    # recent window
-    k = min(30, len(slope))
-    s = slope[-k:]
+    # gradual: negative trend overall
+    trend = np.polyfit(np.arange(len(x)), x, 1)[0]  # slope
+    if trend < -0.05:
+        return "B: Gradual"
 
-    # Rapid: strong negative slope spike
-    if np.min(s) <= -0.5:   # adjust if needed
-        return "A"
+    # intermittent: oscillation (many sign changes in derivative)
+    sign_changes = np.sum(np.sign(d1[:-1]) != np.sign(d1[1:]))
+    if sign_changes >= max(3, len(d1)//6):
+        return "C: Intermittent"
 
-    # Intermittent: many sign changes + noticeable drops
-    sign_changes = np.sum(np.sign(s[1:]) != np.sign(s[:-1]))
-    drop_mag = (np.max(y[-(k+1):]) - np.min(y[-(k+1):]))
-    if sign_changes >= max(3, k // 5) and drop_mag >= 8:
-        return "C"
-
-    # Gradual: overall downward trend
-    # linear fit slope
-    x = t[-(k+1):]
-    yy = y[-(k+1):]
-    if len(x) >= 6:
-        m = np.polyfit(x, yy, 1)[0]  # MAP per second
-        if m < -0.05:
-            return "B"
-
-    return "B"
+    return "B: Gradual"
