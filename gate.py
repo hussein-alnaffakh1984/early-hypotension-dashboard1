@@ -1,18 +1,20 @@
 import numpy as np
 import pandas as pd
 
-def apply_gate(X: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+def apply_gate(df_vitals: pd.DataFrame) -> pd.Series:
     """
-    Returns (X_gated, gate_mask)
-    gate_mask=True means row is OK, False means row was gated heavily.
+    يرجع gate_mask (True = اسمح بالإنذار/التنبؤ)
+    Gate بسيط:
+      - إذا MAP منخفض جدًا (<= 65) -> True
+      - أو إذا MAP_drop_2m <= -8 -> True
+      - غير ذلك False
     """
-    X = X.copy()
+    # افتراضات آمنة لو الأعمدة ناقصة
+    map_now = pd.to_numeric(df_vitals.get("MAP", np.nan), errors="coerce")
+    map_drop_2m = pd.to_numeric(df_vitals.get("MAP_drop_2m", np.nan), errors="coerce")
 
-    # row quality: if too many NaNs, mark as bad
-    nan_ratio = X.isna().mean(axis=1)
+    cond1 = map_now <= 65
+    cond2 = map_drop_2m <= -8
 
-    # basic clipping for numeric stability (keep NaN)
-    X = X.replace([np.inf, -np.inf], np.nan)
-
-    gate_mask = nan_ratio <= 0.60  # allow up to 60% NaN (model has imputer anyway)
-    return X, gate_mask
+    mask = (cond1 | cond2).fillna(False)
+    return mask.astype(bool)
