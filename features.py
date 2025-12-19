@@ -1,69 +1,51 @@
-import pandas as pd
+# features.py
 import numpy as np
+import pandas as pd
 
-def _safe_series(df, col):
-    if col in df.columns:
-        return pd.to_numeric(df[col], errors="coerce")
-    return pd.Series([np.nan] * len(df))
-
-def extract_features_from_timeseries(df: pd.DataFrame) -> pd.DataFrame:
+def extract_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Minimal feature extractor for dashboard inference.
-    IMPORTANT: we will align to feature_cols.joblib later, so missing features become 0.
+    Input df must contain: time, MAP, HR, SpO2 (RR optional).
+    Returns features DataFrame aligned per-row (timeseries features).
     """
     d = df.copy()
 
-    map_s = _safe_series(d, "MAP")
-    hr_s = _safe_series(d, "HR")
-    spo2_s = _safe_series(d, "SpO2")
-    rr_s = _safe_series(d, "RR")
+    # ensure numeric
+    for c in ["MAP", "HR", "SpO2", "RR"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
 
-    # rolling stats (simple + stable)
-    def roll_mean(x, w=30): return x.rolling(w, min_periods=1).mean()
-    def roll_std(x, w=30):  return x.rolling(w, min_periods=2).std()
+    # basic rolling windows (in samples, not seconds)
+    # Works for both 1Hz and irregular data as a simple baseline
+    def roll_mean(x, w): return x.rolling(w, min_periods=1).mean()
+    def roll_std(x, w):  return x.rolling(w, min_periods=1).std().fillna(0)
 
-    feats = pd.DataFrame({
-        "MAP": map_s,
-        "HR": hr_s,
-        "SpO2": spo2_s,
-        "RR": rr_s,
+    feat = pd.DataFrame(index=d.index)
 
-        "MAP_m30": roll_mean(map_s, 30),
-        "MAP_s30": roll_std(map_s, 30),
-        "HR_m30": roll_mean(hr_s, 30),
-        "HR_s30": roll_std(hr_s, 30),
-        "SpO2_m30": roll_mean(spo2_s, 30),
-        "SpO2_s30": roll_std(spo2_s, 30),
+    # Core signals
+    feat["MAP"]  = d["MAP"]
+    feat["HR"]   = d["HR"]
+    feat["SpO2"] = d["SpO2"]
+    feat["RR"]   = d["RR"] if "RR" in d.columns else 0.0
 
-        # simple delta features
-        "MAP_d1": map_s.diff(1),
-        "MAP_d10": map_s.diff(10),
-        "HR_d1": hr_s.diff(1),
-        "SpO2_d1": spo2_s.diff(1),
+    # Rolling stats
+    feat["MAP_m5"]  = roll_mean(d["MAP"], 5)
+    feat["MAP_m15"] = roll_mean(d["MAP"], 15)
+    feat["MAP_s15"] = roll_std(d["MAP"], 15)
 
-        # drop over recent window
-        "MAP_drop_2m": (roll_mean(map_s, 1) - roll_mean(map_s, 120)),
-    })
+    feat["HR_m5"]   = roll_mean(d["HR"], 5)
+    feat["HR_m15"]  = roll_mean(d["HR"], 15)
+    feat["HR_s15"]  = roll_std(d["HR"], 15)
 
-    feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return feats
+    feat["SpO2_m5"]  = roll_mean(d["SpO2"], 5)
+    feat["SpO2_m15"] = roll_mean(d["SpO2"], 15)
+    feat["SpO2_s15"] = roll_std(d["SpO2"], 15)
 
-def extract_features_from_single_row(row: dict) -> pd.DataFrame:
-    """
-    Single-row input → 1-row feature DataFrame.
-    """
-    m = float(row.get("MAP", 0))
-    h = float(row.get("HR", 0))
-    s = float(row.get("SpO2", 0))
-    r = float(row.get("RR", 0))
+    # Simple deltas (trend)
+    feat["MAP_d1"] = d["MAP"].diff().fillna(0)
+    feat["HR_d1"]  = d["HR"].diff().fillna(0)
+    feat["SpO2_d1"]= d["SpO2"].diff().fillna(0)
 
-    feats = pd.DataFrame([{
-        "MAP": m, "HR": h, "SpO2": s, "RR": r,
-        "MAP_m30": m, "MAP_s30": 0.0,
-        "HR_m30": h,  "HR_s30": 0.0,
-        "SpO2_m30": s, "SpO2_s30": 0.0,
-        "MAP_d1": 0.0, "MAP_d10": 0.0,
-        "HR_d1": 0.0, "SpO2_d1": 0.0,
-        "MAP_drop_2m": 0.0,
-    }])
-    return feats
+    # Fill remaining NaNs
+    feat = feat.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(0)
+
+    return feat
