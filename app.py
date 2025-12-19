@@ -21,6 +21,8 @@ st.caption("Upload patient CSV → features → (Gate) → model → alarms")
 # ======================================
 # Load model
 # ======================================
+import joblib
+
 @st.cache_resource
 def load_model():
     return joblib.load("model.joblib")
