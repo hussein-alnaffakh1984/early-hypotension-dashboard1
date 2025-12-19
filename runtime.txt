@@ -1,1 +1,1 @@
-Force Python 3.12 for Streamlit
+python-3.12
