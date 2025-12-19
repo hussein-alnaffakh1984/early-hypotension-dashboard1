@@ -1,18 +1,19 @@
-# gate.py
+import numpy as np
 import pandas as pd
 
-def apply_gate(X: pd.DataFrame) -> pd.DataFrame:
+def apply_gate(df_raw: pd.DataFrame, X: pd.DataFrame, drop_thr: float = -5.0, map_thr: float = 75.0):
     """
-    Simple gate: keep rows where MAP is valid and within plausible range.
-    You can tighten/relax later.
+    Gate بسيط وقابل للتعديل:
+    - إذا MAP_drop_2m <= drop_thr  (يعني هبوط خلال دقيقتين)
+    OR
+    - MAP_m60 <= map_thr          (قرب من hypotension)
+    يرجع: mask (True/False لكل صف)
     """
-    if "MAP" not in X.columns:
-        return X
+    if "MAP_drop_2m" not in X.columns or "MAP_m60" not in X.columns:
+        mask = np.ones(len(X), dtype=bool)
+        return mask
 
-    mask = (X["MAP"] >= 30) & (X["MAP"] <= 160)
-    Xg = X.loc[mask].copy()
-
-    # إذا كل شيء انحذف، رجّع الأصل حتى لا يصير فارغ
-    if len(Xg) == 0:
-        return X.copy()
-    return Xg
+    drop_ok = (X["MAP_drop_2m"].astype(float) <= float(drop_thr))
+    map_ok  = (X["MAP_m60"].astype(float) <= float(map_thr))
+    mask = (drop_ok | map_ok).to_numpy(dtype=bool)
+    return mask
