@@ -1,51 +1,90 @@
-# features.py
 import numpy as np
 import pandas as pd
 
-def extract_features(df: pd.DataFrame) -> pd.DataFrame:
+# feature list = 26 columns (كما في feature_cols.joblib)
+# ['EtCO2_d1','EtCO2_d60','EtCO2_m30','EtCO2_m60','EtCO2_s60',
+#  'HR_d1','HR_d60','HR_m30','HR_m60','HR_s60',
+#  'MAP_d1','MAP_d60','MAP_drop_2m','MAP_m30','MAP_m60','MAP_s60',
+#  'RR_d1','RR_d60','RR_m30','RR_m60','RR_s60',
+#  'SpO2_d1','SpO2_d60','SpO2_m30','SpO2_m60','SpO2_s60']
+
+SIGNALS = ["MAP", "HR", "SpO2", "RR", "EtCO2"]
+
+def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # required minimal
+    if "time" not in df.columns:
+        raise ValueError("CSV must contain 'time' column.")
+    for c in ["MAP", "HR", "SpO2"]:
+        if c not in df.columns:
+            raise ValueError(f"CSV must contain '{c}' column.")
+    # optional
+    if "RR" not in df.columns:
+        df["RR"] = np.nan
+    if "EtCO2" not in df.columns:
+        df["EtCO2"] = np.nan
+    return df
+
+def _estimate_dt(df: pd.DataFrame) -> float:
+    t = pd.to_numeric(df["time"], errors="coerce").to_numpy()
+    t = t[np.isfinite(t)]
+    if len(t) < 3:
+        return 1.0
+    dt = np.diff(t)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if len(dt) == 0:
+        return 1.0
+    med = float(np.median(dt))
+    return 1.0 if (not np.isfinite(med) or med <= 0) else med
+
+def _roll_mean(x: pd.Series, win: int) -> pd.Series:
+    return x.rolling(win, min_periods=1).mean()
+
+def _roll_std(x: pd.Series, win: int) -> pd.Series:
+    return x.rolling(win, min_periods=1).std(ddof=0)
+
+def extract_features_timeseries(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Input df must contain: time, MAP, HR, SpO2 (RR optional).
-    Returns features DataFrame aligned per-row (timeseries features).
+    Input df columns: time, MAP, HR, SpO2 (RR optional, EtCO2 optional)
+    Output: DataFrame with 26 features aligned per-row.
     """
-    d = df.copy()
+    df = _ensure_columns(df)
+    df = df.copy()
+    df["time"] = pd.to_numeric(df["time"], errors="coerce")
+    df = df.sort_values("time").reset_index(drop=True)
 
-    # ensure numeric
-    for c in ["MAP", "HR", "SpO2", "RR"]:
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")
+    dt = _estimate_dt(df)
+    # windows in samples
+    w30 = max(1, int(round(30.0 / dt)))
+    w60 = max(1, int(round(60.0 / dt)))
+    w120 = max(1, int(round(120.0 / dt)))
 
-    # basic rolling windows (in samples, not seconds)
-    # Works for both 1Hz and irregular data as a simple baseline
-    def roll_mean(x, w): return x.rolling(w, min_periods=1).mean()
-    def roll_std(x, w):  return x.rolling(w, min_periods=1).std().fillna(0)
+    feats = {}
 
-    feat = pd.DataFrame(index=d.index)
+    for s in SIGNALS:
+        x = pd.to_numeric(df[s], errors="coerce")
+        m30 = _roll_mean(x, w30)
+        m60 = _roll_mean(x, w60)
+        s60 = _roll_std(x, w60)
 
-    # Core signals
-    feat["MAP"]  = d["MAP"]
-    feat["HR"]   = d["HR"]
-    feat["SpO2"] = d["SpO2"]
-    feat["RR"]   = d["RR"] if "RR" in d.columns else 0.0
+        # deltas: now - 1s and now - 60s (approx by samples)
+        d1  = x - x.shift(max(1, int(round(1.0 / dt))))
+        d60 = x - x.shift(w60)
 
-    # Rolling stats
-    feat["MAP_m5"]  = roll_mean(d["MAP"], 5)
-    feat["MAP_m15"] = roll_mean(d["MAP"], 15)
-    feat["MAP_s15"] = roll_std(d["MAP"], 15)
+        feats[f"{s}_m30"] = m30
+        feats[f"{s}_m60"] = m60
+        feats[f"{s}_s60"] = s60
+        feats[f"{s}_d1"]  = d1
+        feats[f"{s}_d60"] = d60
 
-    feat["HR_m5"]   = roll_mean(d["HR"], 5)
-    feat["HR_m15"]  = roll_mean(d["HR"], 15)
-    feat["HR_s15"]  = roll_std(d["HR"], 15)
+    # MAP_drop_2m: current MAP - MAP 2 minutes ago (negative = drop)
+    MAP = pd.to_numeric(df["MAP"], errors="coerce")
+    feats["MAP_drop_2m"] = MAP - MAP.shift(w120)
 
-    feat["SpO2_m5"]  = roll_mean(d["SpO2"], 5)
-    feat["SpO2_m15"] = roll_mean(d["SpO2"], 15)
-    feat["SpO2_s15"] = roll_std(d["SpO2"], 15)
+    X = pd.DataFrame(feats)
+    # replace inf
+    X = X.replace([np.inf, -np.inf], np.nan)
+    # fill NaNs (forward then 0)
+    X = X.ffill().fillna(0.0)
 
-    # Simple deltas (trend)
-    feat["MAP_d1"] = d["MAP"].diff().fillna(0)
-    feat["HR_d1"]  = d["HR"].diff().fillna(0)
-    feat["SpO2_d1"]= d["SpO2"].diff().fillna(0)
-
-    # Fill remaining NaNs
-    feat = feat.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(0)
-
-    return feat
+    return X
