@@ -3,178 +3,165 @@ import pandas as pd
 import numpy as np
 import joblib
 
-from features import extract_features
+from features import extract_features_timeseries
 from gate import apply_gate
-from alarm import generate_alarm
+from alarm import refractory_alarm
 
-# ======================================
-# Page config
-# ======================================
-st.set_page_config(
-    page_title="Hypotension Early Warning Dashboard",
-    layout="wide"
-)
+st.set_page_config(page_title="Hypotension Early Warning Dashboard", layout="wide")
 
 st.title("🫀 Hypotension Early Warning Dashboard")
 st.caption("Upload patient CSV → features → (Gate) → model → alarms")
 
-# ======================================
-# Load model
-# ======================================
-import joblib
-
+# -----------------------------
+# Load model + feature cols
+# -----------------------------
 @st.cache_resource
-def load_model():
-    return joblib.load("model.joblib")
+def load_artifacts():
+    model = joblib.load("model.joblib")  # RF model (بدون Pipeline)
+    feat_cols = joblib.load("feature_cols.joblib")  # list of 26 feature names
+    return model, feat_cols
 
-model = load_model()
+def safe_float_cols(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return X
 
-# Try to get expected feature count
-EXPECTED_N_FEATURES = getattr(model, "n_features_in_", None)
+# -----------------------------
+# Sidebar - patient info + settings
+# -----------------------------
+st.sidebar.header("🧾 Patient Summary")
+patient_id = st.sidebar.text_input("🧑‍⚕️ Patient ID", value="P-001")
+age = st.sidebar.number_input("🎂 Age", min_value=0, max_value=120, value=45)
+sex = st.sidebar.selectbox("⚧ Sex", ["Male", "Female"])
+unit = st.sidebar.selectbox("🏥 ICU / OR", ["ICU", "OR"])
 
-# ======================================
-# Sidebar – Patient Info
-# ======================================
-st.sidebar.header("🧑‍⚕️ Patient Information")
-
-patient_id = st.sidebar.text_input("Patient ID", "P-001")
-age = st.sidebar.number_input("Age", 0, 120, 45)
-sex = st.sidebar.selectbox("Sex", ["Male", "Female"])
-location = st.sidebar.selectbox("ICU / OR", ["ICU", "OR"])
+st.sidebar.header("⚙️ Model Settings")
+threshold = st.sidebar.slider("Threshold (Alarm)", 0.01, 0.99, 0.15, 0.01)
+refract_sec = st.sidebar.slider("Refractory (sec)", 0, 600, 180, 30)
 
 drop_type = st.sidebar.selectbox(
-    "Drop Type",
-    ["A: Rapid", "B: Gradual", "C: Intermittent"]
+    "اختيار نوع الهبوط",
+    ["A: Rapid", "B: Gradual", "C: Intermittent"],
+    index=0
 )
 
-# ======================================
-# Sidebar – Model Settings
-# ======================================
-st.sidebar.header("⚙️ Model Settings")
-
-threshold = st.sidebar.slider("Alarm Threshold", 0.01, 0.9, 0.15)
 use_gate = st.sidebar.checkbox("Enable Gate", value=True)
+gate_drop_thr = st.sidebar.slider("Gate: MAP_drop_2m threshold", -30.0, 0.0, -5.0, 0.5)
+gate_map_thr  = st.sidebar.slider("Gate: MAP_m60 threshold", 40.0, 120.0, 75.0, 1.0)
 
-# ======================================
-# Data Input
-# ======================================
-st.subheader("📥 Data Input")
+st.sidebar.header("📥 Input Mode")
+mode = st.sidebar.radio("Choose input", ["Upload CSV", "Manual input"], index=0)
 
-input_mode = st.radio(
-    "Choose input mode:",
-    ["Upload CSV", "Manual Entry"]
-)
+# -----------------------------
+# Input
+# -----------------------------
+df = None
 
-# ======================================
-# Manual Input
-# ======================================
-if input_mode == "Manual Entry":
-    col1, col2, col3, col4 = st.columns(4)
+if mode == "Upload CSV":
+    uploaded = st.file_uploader("Upload patient CSV file", type=["csv"])
+    st.info("CSV must contain at least: time, MAP, HR, SpO2 (RR optional).")
+    if uploaded is not None:
+        df = pd.read_csv(uploaded)
 
-    MAP = col1.number_input("MAP", 30.0, 120.0, 75.0)
-    HR = col2.number_input("HR", 30.0, 200.0, 85.0)
-    SpO2 = col3.number_input("SpO2", 50.0, 100.0, 96.0)
-    RR = col4.number_input("RR (optional)", 5.0, 40.0, 18.0)
+else:
+    st.subheader("✍️ Manual Input (no CSV)")
+    c1, c2, c3, c4 = st.columns(4)
+    MAP = c1.number_input("MAP", value=80.0)
+    HR  = c2.number_input("HR", value=78.0)
+    SpO2 = c3.number_input("SpO2", value=98.0)
+    RR  = c4.number_input("RR", value=16.0)
 
+    # نصنع سلسلة 2 دقائق حتى نقدر نحسب rolling features
+    n = 180
     df = pd.DataFrame({
-        "time": [0],
-        "MAP": [MAP],
-        "HR": [HR],
-        "SpO2": [SpO2],
-        "RR": [RR],
+        "time": np.arange(n, dtype=float),
+        "MAP": np.full(n, MAP, dtype=float),
+        "HR": np.full(n, HR, dtype=float),
+        "SpO2": np.full(n, SpO2, dtype=float),
+        "RR": np.full(n, RR, dtype=float),
     })
 
-# ======================================
-# CSV Upload
-# ======================================
-else:
-    uploaded_file = st.file_uploader(
-        "Upload patient CSV file",
-        type=["csv"]
-    )
+# -----------------------------
+# Inference pipeline
+# -----------------------------
+def run_inference(df_in: pd.DataFrame):
+    model, feat_cols = load_artifacts()
 
-    if uploaded_file is None:
-        st.info("⬅️ Upload a patient CSV file to start")
-        st.stop()
+    # ensure minimal cols
+    needed = {"time", "MAP", "HR", "SpO2"}
+    if not needed.issubset(set(df_in.columns)):
+        raise ValueError(f"Missing required columns: {sorted(list(needed - set(df_in.columns)))}")
 
-    df = pd.read_csv(uploaded_file)
+    df_in = df_in.copy()
+    df_in["time"] = pd.to_numeric(df_in["time"], errors="coerce")
+    df_in = df_in.sort_values("time").reset_index(drop=True)
 
-# ======================================
-# Validate columns
-# ======================================
-required_cols = {"time", "MAP", "HR", "SpO2"}
-if not required_cols.issubset(df.columns):
-    st.error(f"CSV must contain at least: {required_cols}")
+    # features
+    X = extract_features_timeseries(df_in)
+    X = safe_float_cols(X)
+
+    # reorder columns exactly as training
+    missing = [c for c in feat_cols if c not in X.columns]
+    extra = [c for c in X.columns if c not in feat_cols]
+    if missing:
+        raise ValueError(f"Feature mismatch: missing columns in X: {missing[:10]} ...")
+    X = X[feat_cols]
+
+    # gate mask
+    if use_gate:
+        gate_mask = apply_gate(df_in, X, drop_thr=gate_drop_thr, map_thr=gate_map_thr)
+    else:
+        gate_mask = np.ones(len(X), dtype=bool)
+
+    # model predict (IMPORTANT: pass numpy float)
+    X_np = X.to_numpy(dtype=np.float32)
+    probs = model.predict_proba(X_np)[:, 1].astype(float)
+
+    # alarms with refractory
+    time_sec = df_in["time"].to_numpy(dtype=float)
+    alarms = refractory_alarm(probs, thr=float(threshold), refract_sec=float(refract_sec), time_sec=time_sec)
+
+    out = df_in.copy()
+    out["risk_score"] = probs
+    out["gate_pass"] = gate_mask.astype(int)
+    out["alarm"] = alarms.astype(int)
+
+    return out
+
+# -----------------------------
+# UI Output
+# -----------------------------
+if df is None:
     st.stop()
 
-# ======================================
-# Raw vitals
-# ======================================
-st.subheader("📈 Raw Vitals")
-plot_cols = ["MAP", "HR", "SpO2"]
-st.line_chart(df[plot_cols])
+try:
+    df_out = run_inference(df)
 
-# ======================================
-# Feature extraction
-# ======================================
-X = extract_features(df)
+    st.subheader("📈 Raw Vitals")
+    show_cols = [c for c in ["MAP", "HR", "SpO2", "RR"] if c in df_out.columns]
+    st.line_chart(df_out.set_index("time")[show_cols])
 
-# Apply Gate
-if use_gate:
-    X = apply_gate(X)
+    st.subheader("🧠 Risk score & Alarm")
+    st.line_chart(df_out.set_index("time")[["risk_score"]])
 
-# ======================================
-# 🔴 CRITICAL FIX: force NumPy & correct shape
-# ======================================
-if EXPECTED_N_FEATURES is not None:
-    if X.shape[1] < EXPECTED_N_FEATURES:
-        for i in range(EXPECTED_N_FEATURES - X.shape[1]):
-            X[f"_pad_{i}"] = 0.0
-    elif X.shape[1] > EXPECTED_N_FEATURES:
-        X = X.iloc[:, :EXPECTED_N_FEATURES]
+    latest = df_out.iloc[-1]
+    st.subheader("🩺 Current Status")
+    a, b, c, d = st.columns(4)
+    a.metric("Patient", patient_id)
+    b.metric("MAP", f"{float(latest['MAP']):.1f}")
+    c.metric("Risk", f"{float(latest['risk_score']):.3f}")
+    d.metric("Alarm", "YES 🚨" if int(latest["alarm"]) == 1 else "NO ✅")
 
-X_np = X.to_numpy(dtype=float)
+    st.write("**Metadata**:", {"Age": int(age), "Sex": sex, "Unit": unit, "DropType": drop_type})
 
-# ======================================
-# Prediction
-# ======================================
-probs = model.predict_proba(X_np)[:, 1]
+    st.subheader("📋 Output table (download)")
+    st.dataframe(df_out.tail(50), use_container_width=True)
 
-df_out = df.copy()
-df_out["risk_score"] = probs
-df_out["alarm"] = df_out["risk_score"].apply(
-    lambda x: generate_alarm(x, threshold)
-)
+    csv_bytes = df_out.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download alarms CSV", data=csv_bytes, file_name=f"{patient_id}_alarms.csv", mime="text/csv")
 
-# ======================================
-# Results
-# ======================================
-st.subheader("🚨 Alarm Timeline")
-st.line_chart(df_out["risk_score"])
-
-latest = df_out.iloc[-1]
-
-st.subheader("🩺 Current Status")
-
-c1, c2, c3 = st.columns(3)
-c1.metric("MAP", f"{latest['MAP']:.1f}")
-c2.metric("Risk Score", f"{latest['risk_score']:.2f}")
-c3.metric(
-    "Alarm",
-    "YES 🚨" if latest["alarm"] else "NO ✅"
-)
-
-# ======================================
-# Patient Summary
-# ======================================
-st.subheader("🧾 Patient Summary")
-
-st.write({
-    "Patient ID": patient_id,
-    "Age": age,
-    "Sex": sex,
-    "Location": location,
-    "Drop Type": drop_type,
-    "Threshold": threshold,
-    "Gate Enabled": use_gate
-})
+except Exception as e:
+    st.error(f"Error: {e}")
+    st.stop()
