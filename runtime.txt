@@ -1,3 +1,1 @@
-git add runtime.txt
-git commit -m "Force Python 3.12 for Streamlit"
-git push
+Force Python 3.12 for Streamlit
