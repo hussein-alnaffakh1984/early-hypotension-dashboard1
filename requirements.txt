@@ -1,6 +1,6 @@
 streamlit
-numpy
 pandas
+numpy
 scikit-learn
 joblib
 matplotlib
