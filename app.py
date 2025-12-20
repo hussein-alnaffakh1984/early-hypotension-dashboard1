@@ -74,6 +74,13 @@ expected_cols = get_expected_feature_columns(model)
 
 
 # ===============================
+# Language helpers
+# ===============================
+def t(lang_code: str, en: str, ar: str) -> str:
+    return en if lang_code == "en" else ar
+
+
+# ===============================
 # Sidebar: Patient Info
 # ===============================
 st.sidebar.header("🧾 Patient Summary")
@@ -103,10 +110,19 @@ drop_text = {"A": "A: Rapid", "B": "B: Gradual", "C": "C: Intermittent"}.get(dro
 st.sidebar.divider()
 
 # ===============================
+# Sidebar: Language
+# ===============================
+st.sidebar.header("🌐 Language")
+lang_ui = st.sidebar.radio("Explanation & Report", ["English", "العربية"], index=0)
+lang_code = "en" if lang_ui == "English" else "ar"
+
+st.sidebar.divider()
+
+# ===============================
 # Sidebar: Input Mode
 # ===============================
-st.sidebar.header("طريقة الإدخال")
-input_mode = st.sidebar.radio("Input Mode", ["CSV Upload", "Manual Entry"], index=0)
+st.sidebar.header(t(lang_code, "Input Mode", "طريقة الإدخال"))
+input_mode = st.sidebar.radio(t(lang_code, "Input Mode", "طريقة الإدخال"), ["CSV Upload", "Manual Entry"], index=0)
 
 
 # ===============================
@@ -140,10 +156,8 @@ def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def align_features_to_expected(X: pd.DataFrame, expected_cols_list) -> pd.DataFrame:
     """
-    Critical fix for:
-    ValueError: feature names should match those that were passed during fit
-    We force X to have EXACT columns in correct order.
-    Missing columns -> filled with NaN (then pipeline imputer handles them).
+    Force X to have EXACT columns in correct order.
+    Missing columns -> NaN (imputer handles them).
     Extra columns -> dropped.
     """
     X = X.copy()
@@ -165,7 +179,6 @@ def safe_apply_gate(X: pd.DataFrame, drop_key: str):
             return X, None
         if len(out) == 1:
             return out[0], None
-        # len >= 2
         return out[0], out[1]
 
     return out, None
@@ -188,7 +201,7 @@ def run_inference(df_raw: pd.DataFrame, threshold: float, use_gate: bool, drop_k
     if use_gate:
         X, gate_mask = safe_apply_gate(X, drop_key=drop_key)
 
-    # 3) Align to trained columns (MOST IMPORTANT)
+    # 3) Align to trained columns
     X = align_features_to_expected(X, expected_cols)
 
     # 4) Predict
@@ -230,22 +243,27 @@ def compare_drop_types(df_raw: pd.DataFrame, threshold: float, use_gate: bool):
 df_input = None
 
 if input_mode == "CSV Upload":
-    uploaded_file = st.file_uploader("Upload patient CSV file", type=["csv"])
-    st.info("CSV must contain at least: time, MAP, HR, SpO2 (RR optional).")
+    uploaded_file = st.file_uploader(t(lang_code, "Upload patient CSV file", "رفع ملف CSV للمريض"), type=["csv"])
+    st.info(t(lang_code,
+              "CSV must contain at least: time, MAP, HR, SpO2 (RR optional).",
+              "يجب أن يحتوي CSV على الأقل: time, MAP, HR, SpO2 (و RR اختياري)."))
 
     if uploaded_file is not None:
         df_input = pd.read_csv(uploaded_file)
 
 else:
-    st.subheader("🧾 Manual Entry (بدون CSV)")
-    st.caption("أدخل قيَم الحيويات (سطر واحد أو أكثر). إذا تريد سلسلة زمنية، زيد عدد النقاط.")
+    st.subheader(t(lang_code, "🧾 Manual Entry", "🧾 إدخال يدوي"))
+    st.caption(t(lang_code,
+                 "Enter vitals as a time series. Increase points for longer signals.",
+                 "أدخل الحيويات كسلسلة زمنية. زد عدد النقاط لطول أكبر."))
 
-    n_points = st.number_input("عدد النقاط الزمنية", min_value=1, max_value=300, value=16, step=1)
+    n_points = st.number_input(t(lang_code, "Number of time points", "عدد النقاط الزمنية"),
+                               min_value=1, max_value=300, value=16, step=1)
 
     colA, colB = st.columns(2)
     with colA:
-        start_time = st.number_input("Start time", value=0.0)
-        step_time = st.number_input("Time step", value=1.0)
+        start_time = st.number_input(t(lang_code, "Start time", "زمن البداية"), value=0.0)
+        step_time = st.number_input(t(lang_code, "Time step", "فاصل الزمن"), value=1.0)
     with colB:
         map_start = st.number_input("MAP start", value=82.0)
         map_end = st.number_input("MAP end", value=56.0)
@@ -255,13 +273,13 @@ else:
     spo2_start = st.number_input("SpO2 start", value=98.0)
     spo2_end = st.number_input("SpO2 end", value=91.0)
 
-    rr_start = st.number_input("RR start (optional)", value=16.0)
-    rr_end = st.number_input("RR end (optional)", value=28.0)
+    rr_start = st.number_input(t(lang_code, "RR start (optional)", "RR بداية (اختياري)"), value=16.0)
+    rr_end = st.number_input(t(lang_code, "RR end (optional)", "RR نهاية (اختياري)"), value=28.0)
 
-    if st.button("Generate Manual Timeseries"):
-        t = np.arange(n_points, dtype=float) * float(step_time) + float(start_time)
+    if st.button(t(lang_code, "Generate Manual Timeseries", "توليد سلسلة زمنية يدويًا")):
+        t_arr = np.arange(n_points, dtype=float) * float(step_time) + float(start_time)
         df_input = pd.DataFrame({
-            "time": t,
+            "time": t_arr,
             "MAP": np.linspace(map_start, map_end, n_points),
             "HR": np.linspace(hr_start, hr_end, n_points),
             "SpO2": np.linspace(spo2_start, spo2_end, n_points),
@@ -273,7 +291,7 @@ else:
 # Run + Display
 # ===============================
 if df_input is None:
-    st.info("⬅️ اختر طريقة إدخال ثم وفّر بيانات.")
+    st.info(t(lang_code, "⬅️ Choose an input method and provide data.", "⬅️ اختر طريقة إدخال ثم وفّر بيانات."))
     st.stop()
 
 try:
@@ -288,7 +306,7 @@ try:
         "Drop Type": drop_text
     }
 
-    st.subheader("📈 Raw Vitals")
+    st.subheader(t(lang_code, "📈 Raw Vitals", "📈 الحيويات الخام"))
     chart_cols = ["HR", "MAP", "SpO2"]
     if "RR" in df_norm.columns:
         chart_cols.append("RR")
@@ -299,74 +317,81 @@ try:
     # Inference
     df_out, gate_mask, X = run_inference(df_norm, threshold=threshold, use_gate=use_gate, drop_key=drop_key)
 
-    st.subheader("🚨 Alarm Timeline")
+    st.subheader(t(lang_code, "🚨 Alarm Timeline", "🚨 خط الإنذار الزمني"))
     st.line_chart(df_out[["risk_score"]])
 
     latest = df_out.iloc[-1]
-    st.subheader("🩺 Current Status")
+    st.subheader(t(lang_code, "🩺 Current Status", "🩺 الحالة الحالية"))
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("MAP", f"{latest['MAP']:.1f}")
-    c2.metric("Risk Score", f"{latest['risk_score']:.3f}")
-    c3.metric("Alarm", "YES 🚨" if latest["alarm"] else "NO ✅")
-    c4.metric("Drop Type", drop_key)
+    c2.metric(t(lang_code, "Risk Score", "درجة الخطر"), f"{latest['risk_score']:.3f}")
+    c3.metric(t(lang_code, "Alarm", "إنذار"), "YES 🚨" if latest["alarm"] else "NO ✅")
+    c4.metric(t(lang_code, "Drop Type", "نوع الهبوط"), drop_key)
 
-    # ✅ NEW: Advanced explanation from explain.py
-    st.subheader("🧠 Medical Explanation (auto)")
-    exp = build_medical_explanation(df_out, threshold=threshold, drop_key=drop_key, use_gate=use_gate)
+    # ✅ NEW: Advanced explanation from explain.py (with lang)
+    st.subheader(t(lang_code, "🧠 Medical Explanation (auto)", "🧠 تفسير طبي (آلي)"))
+    exp = build_medical_explanation(
+        df_out,
+        threshold=threshold,
+        drop_key=drop_key,
+        use_gate=use_gate,
+        lang=lang_code
+    )
 
     if latest["alarm"]:
         st.error(exp["headline"])
     else:
         st.success(exp["headline"])
 
-    st.markdown("**Why?**")
+    st.markdown(f"**{exp.get('reasons_title', t(lang_code,'Why?','لماذا؟'))}**")
     for r in exp["reasons"]:
         st.write("•", r)
 
-    st.markdown("**Recommendation**")
+    st.markdown(f"**{exp.get('rec_title', t(lang_code,'Recommendation','التوصيات'))}**")
     for r in exp["recommendation"]:
         st.write("•", r)
 
     st.caption(exp["disclaimer"])
 
-    # ✅ NEW: PDF report download
-    st.subheader("📄 PDF Report")
+    # ✅ NEW: PDF report download (with lang)
+    st.subheader(t(lang_code, "📄 PDF Report", "📄 تقرير PDF"))
     pdf_bytes = generate_pdf_report(
         df_out=df_out,
         patient_info=patient_info,
         explanation=exp,
         threshold=threshold,
-        drop_text=drop_text
+        drop_text=drop_text,
+        lang=lang_code
     )
 
     st.download_button(
-        "⬇️ Download PDF Report",
+        t(lang_code, "⬇️ Download PDF Report", "⬇️ تحميل تقرير PDF"),
         data=pdf_bytes,
         file_name=f"{patient_id}_report.pdf",
         mime="application/pdf"
     )
 
     # Show expected model columns
-    with st.expander("Show expected model columns"):
+    with st.expander(t(lang_code, "Show expected model columns", "إظهار أعمدة النموذج المتوقعة")):
         st.write(list(expected_cols))
 
-    with st.expander("Show extracted feature matrix (head)"):
+    with st.expander(t(lang_code, "Show extracted feature matrix (head)", "إظهار أول صفوف مصفوفة الخصائص")):
         st.dataframe(X.head(10), use_container_width=True)
 
     # Compare A/B/C
-    st.subheader("🔁 Compare A / B / C (same data)")
+    st.subheader(t(lang_code, "🔁 Compare A / B / C (same data)", "🔁 مقارنة A / B / C (نفس البيانات)"))
     comp_df = compare_drop_types(df_norm, threshold=threshold, use_gate=use_gate)
     st.dataframe(comp_df, use_container_width=True)
 
     # Download CSV
     st.download_button(
-        "⬇️ Download output CSV (with risk/alarm)",
+        t(lang_code, "⬇️ Download output CSV (with risk/alarm)", "⬇️ تحميل نتائج CSV (الخطر/الإنذار)"),
         data=df_out.to_csv(index=False).encode("utf-8"),
         file_name=f"{patient_id}_output.csv",
         mime="text/csv"
     )
 
 except Exception as e:
-    st.error("Error during inference:")
+    st.error(t(lang_code, "Error during inference:", "خطأ أثناء الاستدلال:"))
     st.exception(e)
