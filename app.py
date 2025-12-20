@@ -515,3 +515,7 @@ try:
 except Exception as e:
     st.error(t(lang_code, "Error during inference:", "خطأ أثناء الاستدلال:"))
     st.exception(e)
+st.write("DEBUG risk_score head:", df_out["risk_score"].head())
+st.write("DEBUG risk_score min/max:",
+         df_out["risk_score"].min(),
+         df_out["risk_score"].max())
