@@ -28,24 +28,40 @@ def _ensure_time_seconds(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
     return df
 
+import numpy as np
+import pandas as pd
 
-def _resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make a 1-second grid so rolling windows in seconds are consistent.
-    """
-    df = _ensure_time_seconds(df)
+def _resample_to_1s(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_raw.copy()
 
-    # ensure signals exist
-    for col in ["MAP", "HR", "SpO2", "RR", "EtCO2"]:
-        if col not in df.columns:
-            df[col] = np.nan
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # تأكد من وجود time
+    if "time" not in df.columns:
+        raise ValueError("Missing required column: time")
 
-    t0 = int(np.floor(df["time"].min()))
-    t1 = int(np.ceil(df["time"].max()))
-    if t1 <= t0:
-        # degenerate
-        return df
+    # ✅ توحيد نوع time: نخليه float دائمًا
+    df["time"] = pd.to_numeric(df["time"], errors="coerce").astype("float64")
+    df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+
+    # إذا الوقت مكرر، خليه آخر قيمة
+    df = df.drop_duplicates(subset=["time"], keep="last")
+
+    # ✅ شبكة 1 ثانية بنفس النوع float64
+    t_min = float(np.floor(df["time"].min()))
+    t_max = float(np.ceil(df["time"].max()))
+    grid = pd.DataFrame({"time": np.arange(t_min, t_max + 1.0, 1.0, dtype=np.float64)})
+
+    # ✅ merge_asof يحتاج النوعين متطابقين
+    df2 = pd.merge_asof(
+        grid.sort_values("time"),
+        df.sort_values("time"),
+        on="time",
+        direction="nearest",
+        tolerance=0.5  # نصف ثانية
+    )
+
+    return df2
+
+
 
     grid = pd.DataFrame({"time": np.arange(t0, t1 + 1, 1, dtype=float)})
 
