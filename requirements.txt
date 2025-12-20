@@ -5,3 +5,5 @@ scikit-learn
 joblib
 matplotlib
 reportlab
+arabic-reshaper
+python-bidi
