@@ -1,3 +1,8 @@
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -24,6 +29,43 @@ def load_model():
     return joblib.load("model.joblib")
 
 model = load_model()
+def patch_simple_imputer(obj):
+    """
+    Fix for: AttributeError: 'SimpleImputer' object has no attribute '_fill_dtype'
+    This happens بسبب عدم توافق نسخة sklearn وقت التدريب مع نسخة التشغيل.
+    """
+    if isinstance(obj, SimpleImputer):
+        if not hasattr(obj, "_fill_dtype"):
+            # safest default dtype for filling
+            obj._fill_dtype = np.float64
+        return
+
+    if isinstance(obj, Pipeline):
+        for _, step in obj.steps:
+            patch_simple_imputer(step)
+        return
+
+    if isinstance(obj, ColumnTransformer):
+        for _, trans, _ in obj.transformers:
+            if trans in ("drop", "passthrough"):
+                continue
+            patch_simple_imputer(trans)
+
+        # remainder transformer
+        rem = getattr(obj, "remainder", None)
+        if rem not in (None, "drop", "passthrough"):
+            patch_simple_imputer(rem)
+        return
+
+    # generic fallback: try known nested estimators
+    if hasattr(obj, "get_params"):
+        for v in obj.get_params(deep=False).values():
+            if hasattr(v, "__class__"):
+                patch_simple_imputer(v)
+
+
+# ✅ apply patch once after loading
+patch_simple_imputer(model)
 
 expected_cols = get_expected_feature_columns(model)
 
