@@ -2,101 +2,100 @@
 import numpy as np
 
 
-def _t(lang: str, en: str, ar: str) -> str:
-    return en if lang == "en" else ar
-
-
 def build_medical_explanation(df_out, threshold: float, drop_key: str, use_gate: bool, lang: str = "en"):
-    """
-    Builds a safe, non-diagnostic explanation text for the dashboard & PDF.
-    """
-    if df_out is None or len(df_out) == 0:
-        return {
-            "headline": _t(lang, "No data available.", "لا توجد بيانات متاحة."),
-            "reasons_title": _t(lang, "Why?", "لماذا؟"),
-            "rec_title": _t(lang, "Recommendation", "التوصيات"),
-            "reasons": [],
-            "recommendation": [],
-            "disclaimer": _t(
-                lang,
-                "Disclaimer: This tool is for decision support only and does not replace clinical judgment.",
-                "تنبيه: هذا النظام للمساعدة على اتخاذ القرار ولا يغني عن الحكم السريري."
-            )
-        }
+    latest = df_out.iloc[-1]
+    MAP = float(latest.get("MAP", np.nan))
+    HR = float(latest.get("HR", np.nan))
+    SpO2 = float(latest.get("SpO2", np.nan))
+    RR = float(latest.get("RR", np.nan)) if "RR" in df_out.columns else np.nan
+    risk = float(latest.get("risk_score", 0.0))
+    alarm = bool(latest.get("alarm", False))
 
-    last = df_out.iloc[-1]
-    MAP = float(last.get("MAP", np.nan))
-    HR = float(last.get("HR", np.nan))
-    SpO2 = float(last.get("SpO2", np.nan))
-    risk = float(last.get("risk_score", np.nan))
-    alarm = bool(last.get("alarm", False))
-
-    reasons = []
-    recs = []
+    if lang == "ar":
+        reasons_title = "لماذا؟"
+        rec_title = "التوصيات"
+        disclaimer = "تنبيه: هذا النظام مساعد قرار وليس بديلاً عن التقييم الطبي."
+    else:
+        reasons_title = "Why?"
+        rec_title = "Recommendation"
+        disclaimer = "Disclaimer: This is a decision-support tool and does not replace clinical judgment."
 
     # Headline
-    if alarm:
-        headline = _t(
-            lang,
-            f"ALERT: Elevated risk of hypotension (risk={risk:.3f} ≥ {threshold:.2f}).",
-            f"إنذار: خطر مرتفع لهبوط الضغط (الخطر={risk:.3f} ≥ {threshold:.2f})."
-        )
+    if lang == "ar":
+        headline = "🚨 إنذار مبكر: خطر هبوط ضغط" if alarm else "✅ لا يوجد إنذار حاليًا"
     else:
-        headline = _t(
-            lang,
-            f"No alert: Risk below threshold (risk={risk:.3f} < {threshold:.2f}).",
-            f"لا يوجد إنذار: الخطر أقل من العتبة (الخطر={risk:.3f} < {threshold:.2f})."
-        )
+        headline = "🚨 Early Warning: Hypotension Risk" if alarm else "✅ No alarm at this moment"
 
-    # Reasons (explainable)
-    if np.isfinite(MAP):
+    reasons = []
+    rec = []
+
+    # Reasons
+    if not np.isnan(MAP):
         if MAP < 65:
-            reasons.append(_t(lang, f"MAP is low ({MAP:.1f} mmHg).", f"MAP منخفض ({MAP:.1f} mmHg)."))
+            reasons.append(("MAP أقل من 65 mmHg" if lang == "ar" else "MAP is below 65 mmHg (hypotension threshold)."))
         else:
-            reasons.append(_t(lang, f"MAP is {MAP:.1f} mmHg.", f"MAP = {MAP:.1f} mmHg."))
+            reasons.append(("MAP ضمن المجال المقبول" if lang == "ar" else "MAP is within an acceptable range."))
 
-    if np.isfinite(HR):
+    if not np.isnan(HR):
         if HR > 100:
-            reasons.append(_t(lang, f"HR is elevated ({HR:.0f} bpm).", f"HR مرتفع ({HR:.0f} bpm)."))
-        else:
-            reasons.append(_t(lang, f"HR is {HR:.0f} bpm.", f"HR = {HR:.0f} bpm."))
+            reasons.append(("HR مرتفع (تسرّع قلبي تعويضي محتمل)" if lang == "ar" else "HR is elevated (possible compensatory tachycardia)."))
 
-    if np.isfinite(SpO2):
+    if not np.isnan(SpO2):
         if SpO2 < 92:
-            reasons.append(_t(lang, f"SpO2 is low ({SpO2:.0f}%).", f"SpO2 منخفض ({SpO2:.0f}%)."))
-        else:
-            reasons.append(_t(lang, f"SpO2 is {SpO2:.0f}%.", f"SpO2 = {SpO2:.0f}%."))
+            reasons.append(("SpO2 منخفض (<92%)" if lang == "ar" else "SpO2 is low (<92%)."))
 
-    reasons.append(_t(lang, f"Drop type used: {drop_key}.", f"نوع الهبوط المستخدم: {drop_key}."))
+    if not np.isnan(RR):
+        if RR > 24:
+            reasons.append(("RR مرتفع (>24)" if lang == "ar" else "RR is elevated (>24)."))
+
+    # Model logic
+    if risk >= threshold:
+        reasons.append((f"درجة الخطر {risk:.3f} ≥ العتبة {threshold:.2f}" if lang == "ar" else f"Risk score {risk:.3f} ≥ threshold {threshold:.2f}."))
+    else:
+        reasons.append((f"درجة الخطر {risk:.3f} < العتبة {threshold:.2f}" if lang == "ar" else f"Risk score {risk:.3f} < threshold {threshold:.2f}."))
+
+    # Drop type
+    if lang == "ar":
+        reasons.append(f"نمط الهبوط المختار: {drop_key}")
+    else:
+        reasons.append(f"Selected drop pattern mode: {drop_key}")
 
     if use_gate:
-        reasons.append(_t(lang, "Gate is enabled (risk may be suppressed outside the pattern).",
-                          "التصفية (Gate) مفعلة (قد يتم تقليل الخطر خارج النمط)."))
+        reasons.append(("Gate مفعّل (تركيز على النمط المختار)" if lang == "ar" else "Gate enabled (pattern-focused selection)."))
 
-    # Recommendations (safe)
+    # Recommendations
     if alarm:
-        recs.extend([
-            _t(lang, "Re-check MAP and validate sensor/line readings.", "أعد قياس MAP وتحقق من دقة الحساس/الخط."),
-            _t(lang, "Assess volume status and clinical context.", "قيّم حالة السوائل والسياق السريري."),
-            _t(lang, "Follow local ICU/OR hypotension protocol if clinically indicated.", "اتبع بروتوكول هبوط الضغط في القسم إذا استدعى الأمر سريريًا."),
-        ])
+        if lang == "ar":
+            rec = [
+                "راجع ضغط المريض فورًا وتأكد من قراءة MAP.",
+                "افحص السبب (نزف/تخدير/سوائل/أدوية موسعة).",
+                "فكر بإجراءات دعم الدورة الدموية حسب البروتوكول.",
+                "راقب التطور خلال الدقائق القادمة."
+            ]
+        else:
+            rec = [
+                "Re-check MAP immediately and confirm measurement quality.",
+                "Assess potential causes (bleeding/anesthesia/fluids/vasodilation).",
+                "Consider hemodynamic support per local protocol.",
+                "Monitor trend closely over the next minutes."
+            ]
     else:
-        recs.extend([
-            _t(lang, "Continue routine monitoring.", "استمر بالمراقبة الروتينية."),
-            _t(lang, "If vitals trend downward, consider closer observation.", "إذا كانت المؤشرات تتجه للأسوأ، زد وتيرة المراقبة."),
-        ])
-
-    disclaimer = _t(
-        lang,
-        "Disclaimer: This tool is for decision support only and does not replace clinical judgment.",
-        "تنبيه: هذا النظام للمساعدة على اتخاذ القرار ولا يغني عن الحكم السريري."
-    )
+        if lang == "ar":
+            rec = [
+                "استمر بالمراقبة.",
+                "إذا ظهرت أعراض أو بدأ MAP ينخفض بسرعة، فعّل الإنذار بعتبة أقل أو راجع الإعدادات."
+            ]
+        else:
+            rec = [
+                "Continue monitoring.",
+                "If symptoms appear or MAP starts dropping rapidly, consider a lower threshold or review settings."
+            ]
 
     return {
         "headline": headline,
-        "reasons_title": _t(lang, "Why?", "لماذا؟"),
-        "rec_title": _t(lang, "Recommendation", "التوصيات"),
+        "reasons_title": reasons_title,
+        "rec_title": rec_title,
         "reasons": reasons,
-        "recommendation": recs,
+        "recommendation": rec,
         "disclaimer": disclaimer
     }
