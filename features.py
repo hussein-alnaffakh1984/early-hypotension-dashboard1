@@ -2,82 +2,134 @@ import numpy as np
 import pandas as pd
 import joblib
 
-FEATURE_COLS_PATH = "feature_cols.joblib"
 
-def _median_dt_seconds(t: pd.Series) -> float:
-    t = pd.to_numeric(t, errors="coerce")
-    dt = t.diff().dropna()
-    if len(dt) == 0:
-        return 1.0
-    m = float(dt.median())
-    if not np.isfinite(m) or m <= 0:
-        return 1.0
-    return m
-
-def _ensure_numeric(df: pd.DataFrame, cols):
-    out = df.copy()
-    for c in cols:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out
-
-def _rolling_mean(x: pd.Series, w: int) -> pd.Series:
-    return x.rolling(window=w, min_periods=1).mean()
-
-def _rolling_std(x: pd.Series, w: int) -> pd.Series:
-    return x.rolling(window=w, min_periods=2).std()
-
-def extract_features(df_raw: pd.DataFrame) -> pd.DataFrame:
+def get_expected_feature_columns(model=None, feature_cols_path="feature_cols.joblib"):
     """
-    ينتج DataFrame Features بأعمدة مطابقة 100% للـ feature_cols.joblib
-    (حتى لو RR أو EtCO2 غير موجودين في CSV -> نملأها NaN)
+    Priority:
+      1) feature_cols.joblib (if exists)
+      2) model.feature_names_in_ (if available)
     """
-    feature_cols = joblib.load(FEATURE_COLS_PATH)
+    try:
+        cols = joblib.load(feature_cols_path)
+        return list(cols)
+    except Exception:
+        pass
 
+    if model is not None and hasattr(model, "feature_names_in_"):
+        return list(model.feature_names_in_)
+
+    # fallback minimal
+    return [
+        "MAP_filled", "HR", "SpO2", "EtCO2", "RR"
+    ]
+
+
+def _rolling_mean(s: pd.Series, win: int):
+    return s.rolling(window=win, min_periods=1).mean()
+
+
+def _rolling_std(s: pd.Series, win: int):
+    return s.rolling(window=win, min_periods=1).std().fillna(0.0)
+
+
+def _diff(s: pd.Series, k: int):
+    return s.diff(periods=k).fillna(0.0)
+
+
+def _infer_step_for_minutes(df: pd.DataFrame, minutes: float):
+    """
+    Infer how many rows correspond to X minutes based on median dt from 'time'.
+    If time is in seconds, minutes=2 => 120 seconds.
+    If time is in minutes, minutes=2 => 2 minutes.
+    """
+    t = df["time"].to_numpy()
+    if len(t) < 2:
+        return 1
+    dt = np.median(np.diff(t))
+    if dt <= 0 or np.isnan(dt):
+        return 1
+
+    # assume minutes unit if dt is ~1 or ~0.5 etc, otherwise might be seconds.
+    # We'll compute steps using minutes directly as given.
+    steps = int(round(minutes / dt))
+    return max(1, steps)
+
+
+def build_feature_matrix(df_raw: pd.DataFrame, expected_cols: list):
+    """
+    Build a feature matrix with EXACT expected columns.
+    df_raw must already contain: time, MAP, HR, SpO2, and optionally RR, EtCO2.
+    """
     df = df_raw.copy()
-    if "time" not in df.columns:
-        # إذا ماكو time نسوي time تسلسلي
-        df["time"] = np.arange(len(df), dtype=float)
 
-    df = _ensure_numeric(df, ["time", "MAP", "HR", "SpO2", "RR", "EtCO2"])
-    df = df.sort_values("time").reset_index(drop=True)
+    # Ensure optional columns exist
+    if "RR" not in df.columns:
+        df["RR"] = np.nan
+    if "EtCO2" not in df.columns:
+        df["EtCO2"] = np.nan
 
-    dt = _median_dt_seconds(df["time"])
-    w30 = max(1, int(round(30.0 / dt)))
-    w60 = max(1, int(round(60.0 / dt)))
-    w120 = max(1, int(round(120.0 / dt)))  # 2 minutes
+    # Fill MAP for stability
+    df["MAP_filled"] = df["MAP"].ffill().bfill()
 
-    # إذا العمود ناقص نخلّيه NaN
-    for base in ["MAP", "HR", "SpO2", "RR", "EtCO2"]:
-        if base not in df.columns:
-            df[base] = np.nan
+    # infer steps for 30/60 "units" (we treat them as rows if series is short)
+    # Many people name m30/m60 as "moving average windows".
+    # We implement them as rolling mean window size = min(30, len).
+    win30 = min(30, len(df))
+    win60 = min(60, len(df))
 
-    feats = pd.DataFrame(index=df.index)
+    # Also derive steps for "drop_2m" and "d60"
+    k2m = _infer_step_for_minutes(df, minutes=2.0)
+    k60 = min(60, len(df) - 1) if len(df) > 1 else 1
 
-    # Helper to build feature set for a signal
-    def build_for(sig: str):
-        s = df[sig].astype(float)
+    X = pd.DataFrame(index=df.index)
 
-        feats[f"{sig}_d1"]  = s.diff(1)
-        feats[f"{sig}_d60"] = s.diff(w60)
+    # MAP
+    X["MAP_filled"] = df["MAP_filled"]
+    X["MAP_m30"] = _rolling_mean(df["MAP_filled"], win30)
+    X["MAP_m60"] = _rolling_mean(df["MAP_filled"], win60)
+    X["MAP_s60"] = _rolling_std(df["MAP_filled"], win60)
+    X["MAP_d1"] = _diff(df["MAP_filled"], 1)
+    X["MAP_d60"] = _diff(df["MAP_filled"], k60)
+    X["MAP_drop_2m"] = df["MAP_filled"] - df["MAP_filled"].shift(k2m)
+    X["MAP_drop_2m"] = X["MAP_drop_2m"].fillna(0.0)
 
-        feats[f"{sig}_m30"] = _rolling_mean(s, w30)
-        feats[f"{sig}_m60"] = _rolling_mean(s, w60)
+    # HR
+    X["HR"] = df["HR"]
+    X["HR_m30"] = _rolling_mean(df["HR"], win30)
+    X["HR_m60"] = _rolling_mean(df["HR"], win60)
+    X["HR_s60"] = _rolling_std(df["HR"], win60)
+    X["HR_d1"] = _diff(df["HR"], 1)
+    X["HR_d60"] = _diff(df["HR"], k60)
 
-        feats[f"{sig}_s60"] = _rolling_std(s, w60)
+    # SpO2
+    X["SpO2"] = df["SpO2"]
+    X["SpO2_m30"] = _rolling_mean(df["SpO2"], win30)
+    X["SpO2_m60"] = _rolling_mean(df["SpO2"], win60)
+    X["SpO2_s60"] = _rolling_std(df["SpO2"], win60)
+    X["SpO2_d1"] = _diff(df["SpO2"], 1)
+    X["SpO2_d60"] = _diff(df["SpO2"], k60)
 
-    for sig in ["MAP", "HR", "SpO2", "RR", "EtCO2"]:
-        build_for(sig)
+    # EtCO2 (may be missing -> NaN; keep numeric)
+    X["EtCO2"] = df["EtCO2"].astype(float)
+    X["EtCO2_m30"] = _rolling_mean(X["EtCO2"], win30)
+    X["EtCO2_m60"] = _rolling_mean(X["EtCO2"], win60)
+    X["EtCO2_s60"] = _rolling_std(X["EtCO2"], win60)
+    X["EtCO2_d1"] = _diff(X["EtCO2"], 1)
+    X["EtCO2_d60"] = _diff(X["EtCO2"], k60)
 
-    # MAP_drop_2m = current MAP - mean(MAP over last 2 minutes)
-    map_mean_2m = _rolling_mean(df["MAP"].astype(float), w120)
-    feats["MAP_drop_2m"] = df["MAP"].astype(float) - map_mean_2m
+    # RR
+    X["RR"] = df["RR"].astype(float)
+    X["RR_m30"] = _rolling_mean(X["RR"], win30)
+    X["RR_m60"] = _rolling_mean(X["RR"], win60)
+    X["RR_s60"] = _rolling_std(X["RR"], win60)
+    X["RR_d1"] = _diff(X["RR"], 1)
+    X["RR_d60"] = _diff(X["RR"], k60)
 
-    # الآن نضمن نفس الأعمدة وبنفس الترتيب
-    for c in feature_cols:
-        if c not in feats.columns:
-            feats[c] = np.nan
+    # Reorder and ensure all expected columns exist
+    for c in expected_cols:
+        if c not in X.columns:
+            X[c] = 0.0
 
-    feats = feats[feature_cols]
+    X = X[expected_cols].copy()
 
-    return feats
+    return X
