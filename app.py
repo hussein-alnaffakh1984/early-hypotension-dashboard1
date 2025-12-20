@@ -25,7 +25,9 @@ def load_model():
 
 model = load_model()
 
-expected_cols = get_expected_feature_columns(model, "feature_cols.joblib")
+expected_cols = get_expected_feature_columns(model)
+
+
 
 
 # ===============================
