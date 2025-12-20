@@ -31,35 +31,48 @@ def _ensure_time_seconds(df: pd.DataFrame) -> pd.DataFrame:
 import numpy as np
 import pandas as pd
 
+import numpy as np
+import pandas as pd
+
 def _resample_to_1s(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
 
-    # تأكد من وجود time
     if "time" not in df.columns:
         raise ValueError("Missing required column: time")
 
-    # ✅ توحيد نوع time: نخليه float دائمًا
-    df["time"] = pd.to_numeric(df["time"], errors="coerce").astype("float64")
+    # 1) time -> numeric
+    df["time"] = pd.to_numeric(df["time"], errors="coerce")
     df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
 
-    # إذا الوقت مكرر، خليه آخر قيمة
-    df = df.drop_duplicates(subset=["time"], keep="last")
+    # 2) ✅ حول الوقت إلى ثواني INT (هذا يحل float/int نهائياً)
+    # إذا الوقت أصلاً بالثواني وفيه كسور، نقرّبه لأقرب ثانية
+    df["time_s"] = np.round(df["time"].astype(float)).astype(np.int64)
 
-    # ✅ شبكة 1 ثانية بنفس النوع float64
-    t_min = float(np.floor(df["time"].min()))
-    t_max = float(np.ceil(df["time"].max()))
-    grid = pd.DataFrame({"time": np.arange(t_min, t_max + 1.0, 1.0, dtype=np.float64)})
+    # 3) إزالة التكرار بنفس الثانية (احتفظ بآخر قراءة)
+    df = df.drop_duplicates(subset=["time_s"], keep="last").reset_index(drop=True)
 
-    # ✅ merge_asof يحتاج النوعين متطابقين
+    # 4) شبكة 1 ثانية INT أيضاً
+    t_min = int(df["time_s"].min())
+    t_max = int(df["time_s"].max())
+    grid = pd.DataFrame({"time_s": np.arange(t_min, t_max + 1, 1, dtype=np.int64)})
+
+    # 5) ✅ merge_asof على time_s (int مع int)
     df2 = pd.merge_asof(
-        grid.sort_values("time"),
-        df.sort_values("time"),
-        on="time",
+        grid.sort_values("time_s"),
+        df.sort_values("time_s"),
+        on="time_s",
         direction="nearest",
-        tolerance=0.5  # نصف ثانية
+        tolerance=0  # لأن time_s صار integer بالضبط
     )
 
+    # 6) رجّع عمود time الأصلي (اختياري) أو اصنع time من time_s
+    # نخلي time = time_s حتى يكون واضح أنه بالثواني
+    df2["time"] = df2["time_s"].astype(np.float64)
+
+    # احذف time_s إذا لا تحتاجه
+    # (إذا عندك أجزاء أخرى تعتمد على time_s اتركه)
     return df2
+
 
 
 
