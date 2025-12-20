@@ -10,138 +10,197 @@ def get_expected_feature_columns(model):
     if hasattr(model, "feature_names_in_"):
         return list(model.feature_names_in_)
     # fallback
-    return ["MAP_filled", "HR", "SpO2", "RR", "EtCO2"]
+    return [
+        "MAP_filled",
+        "MAP_m30","MAP_m60","MAP_s60","MAP_d1","MAP_d60","MAP_drop_2m",
+        "HR","HR_m30","HR_m60","HR_s60","HR_d1","HR_d60",
+        "SpO2","SpO2_m30","SpO2_m60","SpO2_s60","SpO2_d1","SpO2_d60",
+        "EtCO2","EtCO2_m30","EtCO2_m60","EtCO2_s60","EtCO2_d1","EtCO2_d60",
+        "RR","RR_m30","RR_m60","RR_s60","RR_d1","RR_d60",
+    ]
 
 
-def _to_num(s):
-    return pd.to_numeric(s, errors="coerce")
+def _ensure_time_seconds(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "time" not in df.columns:
+        raise ValueError("CSV must contain 'time' column.")
+    df["time"] = pd.to_numeric(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    return df
 
 
-def _infer_dt(time_arr: np.ndarray) -> float:
-    """Infer median sampling interval from time column."""
-    if time_arr is None or len(time_arr) < 3:
-        return 1.0
-    diffs = np.diff(time_arr.astype(float))
-    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
-    if len(diffs) == 0:
-        return 1.0
-    dt = float(np.median(diffs))
-    return 1.0 if (not np.isfinite(dt) or dt <= 0) else dt
-
-
-def _steps_for_seconds(seconds: float, dt: float) -> int:
-    return max(1, int(round(float(seconds) / float(dt))))
-
-
-def _shift(arr: np.ndarray, k: int):
-    """Shift forward by k (current - past)."""
-    s = pd.Series(arr)
-    return s.shift(k).to_numpy()
-
-
-def _diff(arr: np.ndarray, k: int):
-    """arr - arr shifted by k."""
-    return arr - _shift(arr, k)
-
-
-def _slope(arr: np.ndarray, win: int):
+def _resample_to_1s(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Simple slope proxy over window:
-    slope ≈ (x[t] - x[t-win]) / win
+    Make a 1-second grid so rolling windows in seconds are consistent.
     """
-    if win <= 0:
-        win = 1
-    d = _diff(arr, win)
-    return d / float(win)
+    df = _ensure_time_seconds(df)
+
+    # ensure signals exist
+    for col in ["MAP", "HR", "SpO2", "RR", "EtCO2"]:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    t0 = int(np.floor(df["time"].min()))
+    t1 = int(np.ceil(df["time"].max()))
+    if t1 <= t0:
+        # degenerate
+        return df
+
+    grid = pd.DataFrame({"time": np.arange(t0, t1 + 1, 1, dtype=float)})
+
+    # asof merge to nearest previous sample then interpolate
+    df2 = pd.merge_asof(
+        grid.sort_values("time"),
+        df.sort_values("time"),
+        on="time",
+        direction="backward",
+        tolerance=10_000  # large tolerance
+    )
+
+    # interpolate for smoother time series
+    for col in ["MAP", "HR", "SpO2", "RR", "EtCO2"]:
+        df2[col] = df2[col].interpolate(limit_direction="both")
+
+    return df2
+
+
+def _rolling_feats(s: pd.Series, win: int):
+    """
+    win is in seconds on 1s grid.
+    """
+    m = s.rolling(win, min_periods=max(3, win // 3)).mean()
+    std = s.rolling(win, min_periods=max(3, win // 3)).std()
+    return m, std
+
+
+def _diff_lag(s: pd.Series, lag: int):
+    """
+    Difference with lag seconds: current - lagged
+    """
+    return s - s.shift(lag)
+
+
+def compute_drop_scores(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Produce per-time scores for Rapid/Gradual/Intermittent patterns.
+    This is used to make A/B/C actually DIFFERENT (AUTO + weighting).
+    """
+    df = _resample_to_1s(df_raw)
+
+    map_f = df["MAP"].ffill().bfill()
+    # rapid: sharp drop over 2 minutes + negative slope
+    drop_2m = (map_f.shift(120) - map_f).clip(lower=0)  # positive when dropping
+    slope_60 = (map_f - map_f.shift(60))  # negative means falling
+
+    rapid_score = (drop_2m / 15.0) + (-slope_60.clip(upper=0) / 10.0)
+
+    # gradual: sustained fall over 60-180 sec (without big abrupt)
+    drop_1m = (map_f.shift(60) - map_f).clip(lower=0)
+    drop_3m = (map_f.shift(180) - map_f).clip(lower=0)
+    gradual_score = (drop_3m / 20.0) + (drop_1m / 15.0) - (drop_2m / 20.0)
+
+    # intermittent: oscillation/instability (variance + sign changes)
+    _, std_60 = _rolling_feats(map_f, 60)
+    d1 = map_f.diff()
+    sign_changes = (np.sign(d1).diff().abs() > 0).astype(float).rolling(60, min_periods=10).mean()
+    intermittent_score = (std_60.fillna(0) / 6.0) + (sign_changes.fillna(0) / 0.25)
+
+    scores = pd.DataFrame({
+        "time": df["time"].values,
+        "score_A_rapid": rapid_score.replace([np.inf, -np.inf], np.nan).fillna(0).values,
+        "score_B_gradual": gradual_score.replace([np.inf, -np.inf], np.nan).fillna(0).values,
+        "score_C_intermittent": intermittent_score.replace([np.inf, -np.inf], np.nan).fillna(0).values,
+    })
+
+    # normalize 0..1 per case
+    for c in ["score_A_rapid", "score_B_gradual", "score_C_intermittent"]:
+        mx = float(scores[c].max()) if len(scores) else 0.0
+        if mx <= 1e-9:
+            scores[c + "_n"] = 0.0
+        else:
+            scores[c + "_n"] = (scores[c] / mx).clip(0, 1)
+
+    # AUTO label per time
+    arr = scores[["score_A_rapid_n", "score_B_gradual_n", "score_C_intermittent_n"]].to_numpy()
+    idx = np.argmax(arr, axis=1)
+    labels = np.array(["A", "B", "C"])[idx]
+    scores["drop_auto"] = labels
+
+    return scores
 
 
 def build_feature_matrix(df_raw: pd.DataFrame, expected_cols: list) -> pd.DataFrame:
     """
-    Build X that matches EXACTLY the columns the model was trained on.
-
-    It computes common engineered features used in your model:
-    - *_m30, *_m60  : lag (previous value)
-    - *_s60         : slope over 60 seconds window (proxy)
-    - *_d1          : step difference (current - prev)
-    - *_d60         : difference over 60 seconds
-    - MAP_drop_2m   : difference over ~2 minutes (current - value 2 minutes ago)
+    Build X EXACTLY with the columns the model expects.
+    Uses 1-second resampling and window-based rolling features.
     """
-    df = df_raw.copy()
-    df.columns = [c.strip() for c in df.columns]
+    df = _resample_to_1s(df_raw)
 
-    # Required columns
-    if "time" not in df.columns:
-        raise ValueError("CSV must contain a 'time' column.")
-    for base in ["MAP", "HR", "SpO2"]:
-        if base not in df.columns:
-            raise ValueError("CSV must contain MAP, HR, SpO2 (and time).")
+    # signals
+    MAP = df["MAP"].copy()
+    HR = df["HR"].copy()
+    SpO2 = df["SpO2"].copy()
+    RR = df["RR"].copy()
+    EtCO2 = df["EtCO2"].copy()
 
-    # Optional
-    if "RR" not in df.columns:
-        df["RR"] = np.nan
-    if "EtCO2" not in df.columns:
-        df["EtCO2"] = np.nan
+    MAP_filled = MAP.ffill().bfill()
 
-    # numeric + sort
-    df["time"] = _to_num(df["time"])
-    df = df.sort_values("time").reset_index(drop=True)
+    # rolling windows
+    MAP_m30, _ = _rolling_feats(MAP_filled, 30)
+    MAP_m60, MAP_s60 = _rolling_feats(MAP_filled, 60)
+    HR_m30, _ = _rolling_feats(HR, 30)
+    HR_m60, HR_s60 = _rolling_feats(HR, 60)
+    Sp_m30, _ = _rolling_feats(SpO2, 30)
+    Sp_m60, Sp_s60 = _rolling_feats(SpO2, 60)
+    Et_m30, _ = _rolling_feats(EtCO2, 30)
+    Et_m60, Et_s60 = _rolling_feats(EtCO2, 60)
+    RR_m30, _ = _rolling_feats(RR, 30)
+    RR_m60, RR_s60 = _rolling_feats(RR, 60)
 
-    # base signals
-    df["MAP_filled"] = _to_num(df["MAP"]).ffill().bfill()
-    df["HR"] = _to_num(df["HR"])
-    df["SpO2"] = _to_num(df["SpO2"])
-    df["RR"] = _to_num(df["RR"])
-    df["EtCO2"] = _to_num(df["EtCO2"])
+    # diffs
+    MAP_d1 = _diff_lag(MAP_filled, 1)
+    MAP_d60 = _diff_lag(MAP_filled, 60)
+    MAP_drop_2m = (MAP_filled.shift(120) - MAP_filled).clip(lower=0)
 
-    time_arr = df["time"].to_numpy(dtype=float)
-    dt = _infer_dt(time_arr)
+    HR_d1 = _diff_lag(HR, 1)
+    HR_d60 = _diff_lag(HR, 60)
 
-    # window steps
-    k30 = _steps_for_seconds(30.0, dt)
-    k60 = _steps_for_seconds(60.0, dt)
-    k120 = _steps_for_seconds(120.0, dt)  # 2 minutes
+    Sp_d1 = _diff_lag(SpO2, 1)
+    Sp_d60 = _diff_lag(SpO2, 60)
 
-    # Helper to generate features for any signal name
-    def add_features(sig_name: str):
-        arr = df[sig_name].to_numpy(dtype=float)
+    Et_d1 = _diff_lag(EtCO2, 1)
+    Et_d60 = _diff_lag(EtCO2, 60)
 
-        # lags (previous value)
-        df[f"{sig_name}_m30"] = _shift(arr, k30)
-        df[f"{sig_name}_m60"] = _shift(arr, k60)
+    RR_d1 = _diff_lag(RR, 1)
+    RR_d60 = _diff_lag(RR, 60)
 
-        # slope proxy over 60s
-        df[f"{sig_name}_s60"] = _slope(arr, k60)
+    # assemble base df with ALL possible features we might need
+    feat = pd.DataFrame({
+        "MAP_filled": MAP_filled,
+        "MAP_m30": MAP_m30, "MAP_m60": MAP_m60, "MAP_s60": MAP_s60,
+        "MAP_d1": MAP_d1, "MAP_d60": MAP_d60, "MAP_drop_2m": MAP_drop_2m,
 
-        # diffs
-        df[f"{sig_name}_d1"] = _diff(arr, 1)
-        df[f"{sig_name}_d60"] = _diff(arr, k60)
+        "HR": HR,
+        "HR_m30": HR_m30, "HR_m60": HR_m60, "HR_s60": HR_s60,
+        "HR_d1": HR_d1, "HR_d60": HR_d60,
 
-    # Generate for each vital (as in expected list)
-    # Note: model expects MAP_*, HR_*, SpO2_*, RR_*, EtCO2_*
-    # MAP is stored under MAP_filled for base, but engineered names are MAP_* (your expected list uses MAP_*).
-    # لذلك ننشئ MAP features من MAP_filled ولكن بأسماء MAP_*
-    map_arr = df["MAP_filled"].to_numpy(dtype=float)
-    df["MAP_m30"] = _shift(map_arr, k30)
-    df["MAP_m60"] = _shift(map_arr, k60)
-    df["MAP_s60"] = _slope(map_arr, k60)
-    df["MAP_d1"] = _diff(map_arr, 1)
-    df["MAP_d60"] = _diff(map_arr, k60)
-    df["MAP_drop_2m"] = _diff(map_arr, k120)  # current - 2min ago
+        "SpO2": SpO2,
+        "SpO2_m30": Sp_m30, "SpO2_m60": Sp_m60, "SpO2_s60": Sp_s60,
+        "SpO2_d1": Sp_d1, "SpO2_d60": Sp_d60,
 
-    # HR / SpO2 / RR / EtCO2 features
-    add_features("HR")
-    add_features("SpO2")
-    add_features("RR")
-    add_features("EtCO2")
+        "EtCO2": EtCO2,
+        "EtCO2_m30": Et_m30, "EtCO2_m60": Et_m60, "EtCO2_s60": Et_s60,
+        "EtCO2_d1": Et_d1, "EtCO2_d60": Et_d60,
 
-    # Final X in exact trained order
-    X = pd.DataFrame(index=df.index)
-    for c in expected_cols:
-        if c in df.columns:
-            X[c] = df[c]
-        else:
-            # If model expects something else, create it as NaN (safer than 0)
-            # pipeline imputer will handle it
-            X[c] = np.nan
+        "RR": RR,
+        "RR_m30": RR_m30, "RR_m60": RR_m60, "RR_s60": RR_s60,
+        "RR_d1": RR_d1, "RR_d60": RR_d60,
+    })
 
+    # numeric cleanup
+    feat = feat.replace([np.inf, -np.inf], np.nan)
+
+    # return ONLY expected columns in exact order (missing -> NaN)
+    X = feat.reindex(columns=list(expected_cols), fill_value=np.nan)
     return X
