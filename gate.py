@@ -1,20 +1,40 @@
 import numpy as np
 import pandas as pd
 
-def apply_gate(df_vitals: pd.DataFrame) -> pd.Series:
-    """
-    يرجع gate_mask (True = اسمح بالإنذار/التنبؤ)
-    Gate بسيط:
-      - إذا MAP منخفض جدًا (<= 65) -> True
-      - أو إذا MAP_drop_2m <= -8 -> True
-      - غير ذلك False
-    """
-    # افتراضات آمنة لو الأعمدة ناقصة
-    map_now = pd.to_numeric(df_vitals.get("MAP", np.nan), errors="coerce")
-    map_drop_2m = pd.to_numeric(df_vitals.get("MAP_drop_2m", np.nan), errors="coerce")
 
-    cond1 = map_now <= 65
-    cond2 = map_drop_2m <= -8
+def apply_gate(X: pd.DataFrame, drop_key: str = "A"):
+    """
+    Always returns: (X_out, gate_mask)
 
-    mask = (cond1 | cond2).fillna(False)
-    return mask.astype(bool)
+    gate_mask is a boolean array (len = rows of X)
+    drop_key:
+      A = Rapid
+      B = Gradual
+      C = Intermittent
+    """
+
+    X_out = X.copy()
+
+    # If MAP_drop_2m exists, we can use it as a gate signal.
+    if "MAP_drop_2m" not in X_out.columns:
+        gate_mask = np.ones(len(X_out), dtype=bool)
+        return X_out, gate_mask
+
+    d = X_out["MAP_drop_2m"].to_numpy()
+
+    # Gate rules (simple, but stable):
+    if drop_key == "A":
+        # rapid: sharp negative drop
+        gate_mask = d <= -10
+    elif drop_key == "B":
+        # gradual: mild drop sustained
+        gate_mask = d <= -5
+    else:
+        # intermittent: fluctuating drops (abs changes)
+        gate_mask = np.abs(d) >= 7
+
+    # If mask is too strict (all False), don't block everything
+    if gate_mask.sum() == 0:
+        gate_mask = np.ones(len(X_out), dtype=bool)
+
+    return X_out, gate_mask
