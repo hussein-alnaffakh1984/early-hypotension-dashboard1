@@ -125,38 +125,46 @@ def safe_apply_gate(X: pd.DataFrame, drop_key: str):
 
 def apply_drop_weighting(df_out: pd.DataFrame, scores_df: pd.DataFrame, mode: str):
     """
-    Make A/B/C DIFFERENT without retraining:
-    - We weight risk_score using pattern score (0..1).
-    - This is explicit + publishable as 'pattern-aware alarm modulation'.
+    Merge scores into df_out by time, and choose/weight based on mode.
+    ✅ Fix: force BOTH time columns to float64 before merge_asof.
     """
-    df_out = df_out.copy()
-
-    # merge scores on time (nearest)
+    d = df_out.copy()
     s = scores_df.copy()
-    s = s.sort_values("time")
-    d = df_out.copy().sort_values("time")
+
+    # ✅ أهم سطرين لحل merge dtype
+    d["time"] = pd.to_numeric(d["time"], errors="coerce").astype(np.float64)
+    s["time"] = pd.to_numeric(s["time"], errors="coerce").astype(np.float64)
+
+    d = d.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    s = s.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+
     d = pd.merge_asof(d, s, on="time", direction="nearest")
 
-    if mode == "A":
-        w = d["score_A_rapid_n"].fillna(0.0)
-    elif mode == "B":
-        w = d["score_B_gradual_n"].fillna(0.0)
-    elif mode == "C":
-        w = d["score_C_intermittent_n"].fillna(0.0)
+    # mode can be "AUTO" or "A"/"B"/"C"
+    if mode == "AUTO":
+        # pick best based on instantaneous highest score
+        best = d[["score_A", "score_B", "score_C"]].values
+        idx = np.argmax(best, axis=1)
+        # map 0->A,1->B,2->C
+        chosen = np.array(["A", "B", "C"])[idx]
+        d["drop_auto"] = chosen
+        # weight risk_score slightly by chosen score (optional)
+        w = np.choose(idx, [d["score_A"], d["score_B"], d["score_C"]]).astype(np.float64)
+        d["risk_score_weighted"] = (d["risk_score"] * (1.0 + 0.10 * w)).clip(0, 1)
     else:
-        # AUTO: choose per time
-        # map drop_auto -> weight
-        w = np.where(
-            d["drop_auto"] == "A", d["score_A_rapid_n"],
-            np.where(d["drop_auto"] == "B", d["score_B_gradual_n"], d["score_C_intermittent_n"])
-        )
-        w = pd.Series(w).fillna(0.0)
+        key = str(mode).strip().upper()
+        if key not in ["A", "B", "C"]:
+            key = "A"
+        d["drop_auto"] = key
+        w = d[f"score_{key}"].astype(np.float64)
+        d["risk_score_weighted"] = (d["risk_score"] * (1.0 + 0.10 * w)).clip(0, 1)
 
-    # 0.6..1.0 scaling (keeps stability)
-    scale = (0.6 + 0.4 * w.clip(0, 1)).astype(float)
-    d["risk_score"] = (d["risk_score"].astype(float) * scale).clip(0, 1)
+    # decide alarm based on weighted score if exists
+    if "risk_score_weighted" in d.columns:
+        d["risk_score"] = d["risk_score_weighted"]
 
     return d
+
 
 
 def run_inference(df_raw: pd.DataFrame, threshold: float, use_gate: bool, drop_mode: str):
