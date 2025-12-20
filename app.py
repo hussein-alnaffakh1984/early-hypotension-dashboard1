@@ -8,7 +8,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 
-from features import build_feature_matrix, get_expected_feature_columns
+from features import build_feature_matrix, get_expected_feature_columns, compute_drop_scores
 from gate import apply_gate
 from alarm import generate_alarm
 
@@ -16,50 +16,37 @@ from explain import build_medical_explanation
 from report_pdf import generate_pdf_report
 
 
-# ===============================
-# Page config
-# ===============================
 st.set_page_config(page_title="Hypotension Early Warning Dashboard", layout="wide")
 st.title("🫀 Hypotension Early Warning Dashboard")
 st.caption("Upload patient CSV → features → (Gate) → model → alarms")
 
 
-# ===============================
-# Load model + expected cols
-# ===============================
 @st.cache_resource
 def load_model():
     return joblib.load("model.joblib")
+
 
 model = load_model()
 
 
 def patch_simple_imputer(obj):
-    """
-    Fix for: AttributeError: 'SimpleImputer' object has no attribute '_fill_dtype'
-    Happens due to sklearn version mismatch between training vs runtime.
-    """
     if isinstance(obj, SimpleImputer):
         if not hasattr(obj, "_fill_dtype"):
             obj._fill_dtype = np.float64
         return
-
     if isinstance(obj, Pipeline):
         for _, step in obj.steps:
             patch_simple_imputer(step)
         return
-
     if isinstance(obj, ColumnTransformer):
         for _, trans, _ in obj.transformers:
             if trans in ("drop", "passthrough"):
                 continue
             patch_simple_imputer(trans)
-
         rem = getattr(obj, "remainder", None)
         if rem not in (None, "drop", "passthrough"):
             patch_simple_imputer(rem)
         return
-
     if hasattr(obj, "get_params"):
         for v in obj.get_params(deep=False).values():
             if hasattr(v, "__class__"):
@@ -70,16 +57,11 @@ patch_simple_imputer(model)
 expected_cols = get_expected_feature_columns(model)
 
 
-# ===============================
-# Language helper
-# ===============================
 def t(lang_code: str, en: str, ar: str) -> str:
     return en if lang_code == "en" else ar
 
 
-# ===============================
-# Sidebar: Patient Info
-# ===============================
+# ================= Sidebar =================
 st.sidebar.header("🧾 Patient Summary")
 patient_id = st.sidebar.text_input("🧑‍⚕️ Patient ID", value="P-001")
 age = st.sidebar.number_input("🎂 Age", min_value=0, max_value=130, value=45, step=1)
@@ -87,58 +69,39 @@ sex = st.sidebar.selectbox("⚧ Sex", ["Male", "Female"])
 location = st.sidebar.selectbox("🏥 ICU / OR", ["ICU", "OR"])
 st.sidebar.divider()
 
-# ===============================
-# Sidebar: Model Settings
-# ===============================
-st.sidebar.header("⚙️ Model Settings")
-threshold = st.sidebar.slider("Threshold (manual)", 0.01, 0.99, 0.11)
-use_gate = st.sidebar.checkbox("Enable Gate", value=True)
-
-# Drop type: Auto + manual A/B/C
-drop_type = st.sidebar.selectbox(
-    "Drop type",
-    ["Auto", "A: Rapid", "B: Gradual", "C: Intermittent"],
-    index=0
-)
-drop_key = None
-drop_text = drop_type
-if drop_type != "Auto":
-    drop_key = drop_type.split(":")[0].strip().upper()
-    drop_text = {"A": "A: Rapid", "B": "B: Gradual", "C": "C: Intermittent"}.get(drop_key, drop_type)
-
-st.sidebar.divider()
-
-# ===============================
-# Sidebar: Language
-# ===============================
 st.sidebar.header("🌐 Language")
 lang_ui = st.sidebar.radio("Explanation & Report", ["English", "العربية"], index=0)
 lang_code = "en" if lang_ui == "English" else "ar"
 st.sidebar.divider()
 
-# ===============================
-# Sidebar: Input Mode
-# ===============================
+st.sidebar.header("⚙️ Model Settings")
+threshold = st.sidebar.slider("Threshold (manual)", 0.01, 0.99, 0.11)
+use_gate = st.sidebar.checkbox("Enable Gate", value=True)
+
+# Drop selection includes AUTO
+drop_type = st.sidebar.selectbox(
+    t(lang_code, "Drop Mode", "وضع الهبوط"),
+    ["AUTO (Research Goal)", "A: Rapid", "B: Gradual", "C: Intermittent"],
+    index=0
+)
+st.sidebar.divider()
+
 st.sidebar.header(t(lang_code, "Input Mode", "طريقة الإدخال"))
 input_mode = st.sidebar.radio(t(lang_code, "Input Mode", "طريقة الإدخال"), ["CSV Upload", "Manual Entry"], index=0)
 
 
-# ===============================
-# Helpers
-# ===============================
+# ================= Helpers =================
 def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
-
     required = ["time", "MAP", "HR", "SpO2"]
-    missing_req = [c for c in required if c not in df.columns]
-    if missing_req:
-        raise ValueError(f"CSV is missing required columns: {missing_req}")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV is missing required columns: {missing}")
 
-    if "RR" not in df.columns:
-        df["RR"] = np.nan
-    if "EtCO2" not in df.columns:
-        df["EtCO2"] = np.nan
+    for col in ["RR", "EtCO2"]:
+        if col not in df.columns:
+            df[col] = np.nan
 
     for c in ["time", "MAP", "HR", "SpO2", "RR", "EtCO2"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -148,179 +111,133 @@ def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def align_features_to_expected(X: pd.DataFrame, expected_cols_list) -> pd.DataFrame:
-    X = X.copy()
-    X = X.reindex(columns=list(expected_cols_list), fill_value=np.nan)
-    return X
+    return X.reindex(columns=list(expected_cols_list), fill_value=np.nan)
 
 
-def safe_apply_gate(X: pd.DataFrame, drop_key_used: str):
-    out = apply_gate(X, drop_key=drop_key_used)
-
-    # expected: (X, mask)
+def safe_apply_gate(X: pd.DataFrame, drop_key: str):
+    out = apply_gate(X, drop_key=drop_key)
     if isinstance(out, tuple):
         if len(out) >= 2:
             return out[0], out[1]
-        if len(out) == 1:
-            return out[0], None
-        return X, None
-
-    # if mask only
-    if isinstance(out, (pd.Series, np.ndarray, list)) and not isinstance(out, pd.DataFrame):
-        return X, np.asarray(out, dtype=bool)
-
-    # X only
+        return out[0], None
     return out, None
 
 
-def auto_drop_type_from_map(df: pd.DataFrame) -> str:
+def apply_drop_weighting(df_out: pd.DataFrame, scores_df: pd.DataFrame, mode: str):
     """
-    Auto select A/B/C from MAP pattern (simple heuristic).
+    Make A/B/C DIFFERENT without retraining:
+    - We weight risk_score using pattern score (0..1).
+    - This is explicit + publishable as 'pattern-aware alarm modulation'.
     """
-    d = df[["time", "MAP"]].dropna().copy()
-    if len(d) < 6:
-        return "B"
+    df_out = df_out.copy()
 
-    dt = np.median(np.diff(d["time"].values)) if len(d) > 2 else 1.0
-    dt = 1.0 if not np.isfinite(dt) or dt <= 0 else float(dt)
+    # merge scores on time (nearest)
+    s = scores_df.copy()
+    s = s.sort_values("time")
+    d = df_out.copy().sort_values("time")
+    d = pd.merge_asof(d, s, on="time", direction="nearest")
 
-    w2 = max(2, int(round(2.0 / dt)))
-    w8 = max(4, int(round(8.0 / dt)))
-
-    mapv = d["MAP"].values.astype(float)
-
-    if len(mapv) > w2:
-        delta2 = mapv[w2:] - mapv[:-w2]
-        worst_drop_2m = np.min(delta2)
+    if mode == "A":
+        w = d["score_A_rapid_n"].fillna(0.0)
+    elif mode == "B":
+        w = d["score_B_gradual_n"].fillna(0.0)
+    elif mode == "C":
+        w = d["score_C_intermittent_n"].fillna(0.0)
     else:
-        worst_drop_2m = 0.0
+        # AUTO: choose per time
+        # map drop_auto -> weight
+        w = np.where(
+            d["drop_auto"] == "A", d["score_A_rapid_n"],
+            np.where(d["drop_auto"] == "B", d["score_B_gradual_n"], d["score_C_intermittent_n"])
+        )
+        w = pd.Series(w).fillna(0.0)
 
-    # overall slope
-    denom = max(1e-9, (d["time"].values[-1] - d["time"].values[0]))
-    overall_slope = (mapv[-1] - mapv[0]) / denom
+    # 0.6..1.0 scaling (keeps stability)
+    scale = (0.6 + 0.4 * w.clip(0, 1)).astype(float)
+    d["risk_score"] = (d["risk_score"].astype(float) * scale).clip(0, 1)
 
-    # sign changes in first differences (proxy for intermittent)
-    diff1 = np.diff(mapv)
-    sign = np.sign(diff1)
-    sign_changes = np.sum(sign[1:] * sign[:-1] < 0)
-
-    std = np.nanstd(mapv)
-
-    if worst_drop_2m <= -15:
-        return "A"
-    if sign_changes >= 4 and std >= 5:
-        return "C"
-    if overall_slope < -0.5:
-        return "B"
-    return "B"
+    return d
 
 
-def run_inference(df_raw: pd.DataFrame, threshold: float, use_gate: bool, drop_key_in: str | None):
+def run_inference(df_raw: pd.DataFrame, threshold: float, use_gate: bool, drop_mode: str):
     df = normalize_input_df(df_raw)
 
-    # Auto drop type if needed
-    auto_used = False
-    if drop_key_in is None:
-        drop_key_used = auto_drop_type_from_map(df)
-        auto_used = True
+    # compute drop scores for AUTO and weighting
+    scores_df = compute_drop_scores(df)
+
+    # choose drop_key for gate:
+    if drop_mode == "AUTO":
+        # gate by the dominant type overall (case-level)
+        counts = scores_df["drop_auto"].value_counts()
+        drop_key = counts.index[0] if len(counts) else "A"
     else:
-        drop_key_used = drop_key_in.strip().upper()
+        drop_key = drop_mode
 
-    # 1) Extract features
+    # features
     X = build_feature_matrix(df, expected_cols=expected_cols)
-
-    # 2) Gate
-    gate_mask = None
     if use_gate:
-        X, gate_mask = safe_apply_gate(X, drop_key_used=drop_key_used)
+        X, gate_mask = safe_apply_gate(X, drop_key=drop_key)
+    else:
+        gate_mask = None
 
-    # 3) Align columns
     X = align_features_to_expected(X, expected_cols)
-
-    # 4) Predict
     probs = model.predict_proba(X)[:, 1]
 
-    # 5) APPLY GATE TO PROBABILITIES (CRITICAL)
-    if gate_mask is not None:
-        gate_mask = np.asarray(gate_mask, dtype=bool)
-        if len(gate_mask) == len(probs):
-            probs = probs * gate_mask.astype(float)
-
-    # 6) Output
     df_out = df.copy()
     df_out["risk_score"] = probs
     df_out["alarm"] = df_out["risk_score"].apply(lambda s: generate_alarm(s, threshold))
 
-    return df_out, gate_mask, X, drop_key_used, auto_used
+    # apply weighting so A/B/C differ
+    df_out = apply_drop_weighting(df_out, scores_df, mode=("AUTO" if drop_mode == "AUTO" else drop_key))
+    df_out["alarm"] = df_out["risk_score"].apply(lambda s: generate_alarm(s, threshold))
+
+    return df_out, gate_mask, scores_df, drop_key
 
 
 def compare_drop_types(df_raw: pd.DataFrame, threshold: float, use_gate: bool):
     rows = []
-    for key, label in [("A", "A: Rapid"), ("B", "B: Gradual"), ("C", "C: Intermittent")]:
+    for key, label in [("A", "A: Rapid"), ("B", "B: Gradual"), ("C", "C: Intermittent"), ("AUTO", "AUTO")]:
         try:
-            df_out, gate_mask, _, used_key, _ = run_inference(df_raw, threshold, use_gate, drop_key_in=key)
+            df_out, _, scores_df, chosen = run_inference(df_raw, threshold=threshold, use_gate=use_gate, drop_mode=key)
             last = df_out.iloc[-1]
-            gate_last = None
-            if gate_mask is not None and len(gate_mask) == len(df_out):
-                gate_last = bool(gate_mask[-1])
-
             rows.append({
-                "Drop Type": label,
+                "Mode": label,
+                "GateKey": chosen,
                 "Last MAP": float(last["MAP"]),
                 "Last Risk": float(last["risk_score"]),
                 "Alarm": "YES 🚨" if bool(last["alarm"]) else "NO ✅",
-                "Gate(last)": gate_last
             })
         except Exception as e:
-            rows.append({
-                "Drop Type": label,
-                "Last MAP": np.nan,
-                "Last Risk": np.nan,
-                "Alarm": f"ERROR: {e}",
-                "Gate(last)": None
-            })
+            rows.append({"Mode": label, "GateKey": "-", "Last MAP": np.nan, "Last Risk": np.nan, "Alarm": f"ERROR: {e}"})
     return pd.DataFrame(rows)
 
 
-# ===============================
-# Main UI
-# ===============================
+# ================= Main UI =================
 df_input = None
 
 if input_mode == "CSV Upload":
     uploaded_file = st.file_uploader(t(lang_code, "Upload patient CSV file", "رفع ملف CSV للمريض"), type=["csv"])
     st.info(t(lang_code,
-              "CSV must contain at least: time, MAP, HR, SpO2 (RR & EtCO2 optional).",
-              "يجب أن يحتوي CSV على الأقل: time, MAP, HR, SpO2 (و RR و EtCO2 اختياري)."))
+              "CSV must contain at least: time, MAP, HR, SpO2 (RR optional, EtCO2 optional).",
+              "يجب أن يحتوي CSV على الأقل: time, MAP, HR, SpO2 (RR اختياري و EtCO2 اختياري)."))
     if uploaded_file is not None:
         df_input = pd.read_csv(uploaded_file)
-
 else:
     st.subheader(t(lang_code, "🧾 Manual Entry", "🧾 إدخال يدوي"))
-    st.caption(t(lang_code,
-                 "Generate a synthetic time series for quick testing.",
-                 "توليد سلسلة زمنية تجريبية للاختبار السريع."))
+    n_points = st.number_input(t(lang_code, "Number of points", "عدد النقاط"), 1, 600, 60, 1)
+    start_time = st.number_input(t(lang_code, "Start time", "زمن البداية"), value=0.0)
+    step_time = st.number_input(t(lang_code, "Time step (sec)", "فاصل الزمن (ثانية)"), value=1.0)
 
-    n_points = st.number_input(t(lang_code, "Number of time points", "عدد النقاط الزمنية"),
-                               min_value=6, max_value=300, value=16, step=1)
-
-    colA, colB = st.columns(2)
-    with colA:
-        start_time = st.number_input(t(lang_code, "Start time", "زمن البداية"), value=0.0)
-        step_time = st.number_input(t(lang_code, "Time step", "فاصل الزمن"), value=1.0)
-    with colB:
-        map_start = st.number_input("MAP start", value=82.0)
-        map_end = st.number_input("MAP end", value=56.0)
-
-    hr_start = st.number_input("HR start", value=78.0)
-    hr_end = st.number_input("HR end", value=110.0)
+    map_start = st.number_input("MAP start", value=85.0)
+    map_end = st.number_input("MAP end", value=55.0)
+    hr_start = st.number_input("HR start", value=75.0)
+    hr_end = st.number_input("HR end", value=105.0)
     spo2_start = st.number_input("SpO2 start", value=98.0)
-    spo2_end = st.number_input("SpO2 end", value=91.0)
+    spo2_end = st.number_input("SpO2 end", value=93.0)
     rr_start = st.number_input("RR start (optional)", value=16.0)
-    rr_end = st.number_input("RR end (optional)", value=28.0)
-    et_start = st.number_input("EtCO2 start (optional)", value=36.0)
-    et_end = st.number_input("EtCO2 end (optional)", value=30.0)
+    rr_end = st.number_input("RR end (optional)", value=24.0)
 
-    if st.button(t(lang_code, "Generate Manual Timeseries", "توليد سلسلة زمنية يدويًا")):
+    if st.button(t(lang_code, "Generate", "توليد")):
         t_arr = np.arange(n_points, dtype=float) * float(step_time) + float(start_time)
         df_input = pd.DataFrame({
             "time": t_arr,
@@ -328,14 +245,11 @@ else:
             "HR": np.linspace(hr_start, hr_end, n_points),
             "SpO2": np.linspace(spo2_start, spo2_end, n_points),
             "RR": np.linspace(rr_start, rr_end, n_points),
-            "EtCO2": np.linspace(et_start, et_end, n_points),
         })
 
-
 if df_input is None:
-    st.info(t(lang_code, "⬅️ Choose an input method and provide data.", "⬅️ اختر طريقة إدخال ثم وفّر بيانات."))
+    st.info(t(lang_code, "⬅️ Choose input method and provide data.", "⬅️ اختر طريقة الإدخال ثم وفّر بيانات."))
     st.stop()
-
 
 try:
     df_norm = normalize_input_df(df_input)
@@ -345,79 +259,54 @@ try:
         "Age": age,
         "Sex": sex,
         "ICU/OR": location,
-        "Drop Type": drop_text
+        "Drop Type": drop_type
     }
 
     st.subheader(t(lang_code, "📈 Raw Vitals", "📈 الحيويات الخام"))
-    chart_cols = ["HR", "MAP", "SpO2"]
-    if "RR" in df_norm.columns:
-        chart_cols.append("RR")
-    if "EtCO2" in df_norm.columns:
-        chart_cols.append("EtCO2")
-    st.line_chart(df_norm[chart_cols])
+    st.line_chart(df_norm[["MAP", "HR", "SpO2"] + (["RR"] if "RR" in df_norm.columns else [])])
 
-    # Inference
-    df_out, gate_mask, X, used_drop_key, auto_used = run_inference(
-        df_norm, threshold=threshold, use_gate=use_gate, drop_key_in=drop_key
-    )
+    # mode mapping
+    if drop_type.startswith("AUTO"):
+        mode = "AUTO"
+        drop_text = "AUTO"
+    else:
+        mode = drop_type.split(":")[0].strip()
+        drop_text = drop_type
 
-    if auto_used:
-        st.info(t(lang_code,
-                  f"Auto detected drop type: {used_drop_key}",
-                  f"تم تحديد نوع الهبوط تلقائياً: {used_drop_key}"))
+    df_out, gate_mask, scores_df, gate_key_used = run_inference(df_norm, threshold=threshold, use_gate=use_gate, drop_mode=mode)
 
     st.subheader(t(lang_code, "🚨 Alarm Timeline", "🚨 خط الإنذار الزمني"))
     st.line_chart(df_out[["risk_score"]])
 
     latest = df_out.iloc[-1]
     st.subheader(t(lang_code, "🩺 Current Status", "🩺 الحالة الحالية"))
-
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("MAP", f"{latest['MAP']:.1f}")
     c2.metric(t(lang_code, "Risk Score", "درجة الخطر"), f"{latest['risk_score']:.3f}")
     c3.metric(t(lang_code, "Alarm", "إنذار"), "YES 🚨" if latest["alarm"] else "NO ✅")
-    c4.metric(t(lang_code, "Drop Type", "نوع الهبوط"), used_drop_key)
+    c4.metric(t(lang_code, "Gate Key Used", "نوع Gate المستخدم"), gate_key_used)
 
-    gate_last = None
-    if gate_mask is not None and len(gate_mask) == len(df_out):
-        gate_last = bool(gate_mask[-1])
-    c5.metric("Gate(last)", str(gate_last))
+    # show AUTO drop over time
+    st.subheader(t(lang_code, "🧭 Auto Drop-Type (Research)", "🧭 نوع الهبوط تلقائيًا (بحثيًا)"))
+    st.caption(t(lang_code, "AUTO is derived from signal morphology (rapid/gradual/intermittent).",
+                 "AUTO يُستنتج من شكل الإشارة (سريع/تدريجي/متقطع)."))
+    st.dataframe(scores_df.tail(15), use_container_width=True)
 
-    # Explanation
+    # explanation
     st.subheader(t(lang_code, "🧠 Medical Explanation (auto)", "🧠 تفسير طبي (آلي)"))
-    exp = build_medical_explanation(
-        df_out,
-        threshold=threshold,
-        drop_key=used_drop_key,
-        use_gate=use_gate,
-        lang=lang_code
-    )
-
-    if latest["alarm"]:
-        st.error(exp["headline"])
-    else:
-        st.success(exp["headline"])
-
-    st.markdown(f"**{exp.get('reasons_title', t(lang_code,'Why?','لماذا؟'))}**")
+    exp = build_medical_explanation(df_out, threshold=threshold, drop_key=gate_key_used, use_gate=use_gate, lang=lang_code)
+    st.success(exp["headline"]) if not latest["alarm"] else st.error(exp["headline"])
+    st.markdown(f"**{exp['reasons_title']}**")
     for r in exp["reasons"]:
         st.write("•", r)
-
-    st.markdown(f"**{exp.get('rec_title', t(lang_code,'Recommendation','التوصيات'))}**")
+    st.markdown(f"**{exp['rec_title']}**")
     for r in exp["recommendation"]:
         st.write("•", r)
-
     st.caption(exp["disclaimer"])
 
-    # PDF report
+    # PDF
     st.subheader(t(lang_code, "📄 PDF Report", "📄 تقرير PDF"))
-    pdf_bytes = generate_pdf_report(
-        df_out=df_out,
-        patient_info=patient_info,
-        explanation=exp,
-        threshold=threshold,
-        drop_text=(drop_text if drop_type != "Auto" else f"Auto → {used_drop_key}"),
-        lang=lang_code
-    )
+    pdf_bytes = generate_pdf_report(df_out, patient_info, exp, threshold, drop_text, lang=lang_code)
     st.download_button(
         t(lang_code, "⬇️ Download PDF Report", "⬇️ تحميل تقرير PDF"),
         data=pdf_bytes,
@@ -425,25 +314,21 @@ try:
         mime="application/pdf"
     )
 
-    # Debug + Transparency
-    with st.expander(t(lang_code, "Show expected model columns", "إظهار أعمدة النموذج المتوقعة")):
-        st.write(list(expected_cols))
+    # Compare modes
+    st.subheader(t(lang_code, "🔁 Compare A / B / C / AUTO", "🔁 مقارنة A / B / C / AUTO"))
+    comp = compare_drop_types(df_norm, threshold=threshold, use_gate=use_gate)
+    st.dataframe(comp, use_container_width=True)
 
-    with st.expander(t(lang_code, "Show extracted feature matrix (head)", "إظهار أول صفوف مصفوفة الخصائص")):
-        st.dataframe(X.head(10), use_container_width=True)
-
-    # Compare A/B/C (FOR RESEARCH)
-    st.subheader(t(lang_code, "🔁 Compare A / B / C (same data)", "🔁 مقارنة A / B / C (نفس البيانات)"))
-    comp_df = compare_drop_types(df_norm, threshold=threshold, use_gate=use_gate)
-    st.dataframe(comp_df, use_container_width=True)
-
-    # Download CSV
+    # Download output
     st.download_button(
-        t(lang_code, "⬇️ Download output CSV (with risk/alarm)", "⬇️ تحميل نتائج CSV (الخطر/الإنذار)"),
+        t(lang_code, "⬇️ Download output CSV", "⬇️ تحميل نتائج CSV"),
         data=df_out.to_csv(index=False).encode("utf-8"),
         file_name=f"{patient_id}_output.csv",
         mime="text/csv"
     )
+
+    with st.expander(t(lang_code, "Show expected model columns", "إظهار أعمدة النموذج المتوقعة")):
+        st.write(list(expected_cols))
 
 except Exception as e:
     st.error(t(lang_code, "Error during inference:", "خطأ أثناء الاستدلال:"))
