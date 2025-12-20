@@ -11,9 +11,11 @@ from features import build_feature_matrix, get_expected_feature_columns
 from gate import apply_gate
 from alarm import generate_alarm
 
-# ✅ NEW: explanation + PDF report
 from explain import build_medical_explanation
 from report_pdf import generate_pdf_report
+
+# ✅ NEW: Auto A/B/C
+from drop_type import classify_drop_type
 
 
 # ===============================
@@ -30,7 +32,6 @@ st.caption("Upload patient CSV → features → (Gate) → model → alarms")
 @st.cache_resource
 def load_model():
     return joblib.load("model.joblib")
-
 
 model = load_model()
 
@@ -66,10 +67,8 @@ def patch_simple_imputer(obj):
             if hasattr(v, "__class__"):
                 patch_simple_imputer(v)
 
-
 patch_simple_imputer(model)
 
-# expected feature columns exactly as trained
 expected_cols = get_expected_feature_columns(model)
 
 
@@ -92,22 +91,6 @@ location = st.sidebar.selectbox("🏥 ICU / OR", ["ICU", "OR"])
 
 st.sidebar.divider()
 
-# ===============================
-# Sidebar: Model Settings
-# ===============================
-st.sidebar.header("⚙️ Model Settings")
-threshold = st.sidebar.slider("Threshold (manual)", 0.01, 0.99, 0.11)
-use_gate = st.sidebar.checkbox("Enable Gate", value=True)
-
-drop_type = st.sidebar.selectbox(
-    "اختيار نوع الهبوط",
-    ["A: Rapid", "B: Gradual", "C: Intermittent"],
-    index=0
-)
-drop_key = drop_type.split(":")[0].strip()  # "A" / "B" / "C"
-drop_text = {"A": "A: Rapid", "B": "B: Gradual", "C": "C: Intermittent"}.get(drop_key, drop_type)
-
-st.sidebar.divider()
 
 # ===============================
 # Sidebar: Language
@@ -117,6 +100,27 @@ lang_ui = st.sidebar.radio("Explanation & Report", ["English", "العربية"]
 lang_code = "en" if lang_ui == "English" else "ar"
 
 st.sidebar.divider()
+
+
+# ===============================
+# Sidebar: Model Settings
+# ===============================
+st.sidebar.header("⚙️ Model Settings")
+threshold = st.sidebar.slider("Threshold (manual)", 0.01, 0.99, 0.11)
+use_gate = st.sidebar.checkbox("Enable Gate", value=True)
+
+# ✅ Optional override (you can disable it)
+override_drop = st.sidebar.checkbox(t(lang_code, "Override Drop Type", "تغيير نوع الهبوط يدويًا"), value=False)
+manual_drop_type = st.sidebar.selectbox(
+    t(lang_code, "Manual Drop Type", "نوع الهبوط اليدوي"),
+    ["A: Rapid", "B: Gradual", "C: Intermittent"],
+    index=0,
+    disabled=not override_drop
+)
+manual_drop_key = manual_drop_type.split(":")[0].strip()
+
+st.sidebar.divider()
+
 
 # ===============================
 # Sidebar: Input Mode
@@ -129,11 +133,6 @@ input_mode = st.sidebar.radio(t(lang_code, "Input Mode", "طريقة الإدخ�
 # Helpers
 # ===============================
 def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure required columns exist.
-    Required: time, MAP, HR, SpO2
-    Optional: RR, EtCO2
-    """
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
@@ -155,59 +154,35 @@ def normalize_input_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def align_features_to_expected(X: pd.DataFrame, expected_cols_list) -> pd.DataFrame:
-    """
-    Force X to have EXACT columns in correct order.
-    Missing columns -> NaN (imputer handles them).
-    Extra columns -> dropped.
-    """
     X = X.copy()
     X = X.reindex(columns=list(expected_cols_list), fill_value=np.nan)
     return X
 
 
 def safe_apply_gate(X: pd.DataFrame, drop_key: str):
-    """
-    Robustly handle apply_gate returning:
-      - X
-      - (X, mask)
-      - (X, mask, something_else)
-    """
     out = apply_gate(X, drop_key=drop_key)
-
     if isinstance(out, tuple):
         if len(out) == 0:
             return X, None
         if len(out) == 1:
             return out[0], None
         return out[0], out[1]
-
     return out, None
 
 
 def run_inference(df_raw: pd.DataFrame, threshold: float, use_gate: bool, drop_key: str):
-    """
-    Returns:
-      df_out : df with risk_score + alarm
-      gate_mask : optional
-      X_used : feature dataframe used for model
-    """
     df = normalize_input_df(df_raw)
 
-    # 1) Extract features
     X = build_feature_matrix(df, expected_cols=expected_cols)
 
-    # 2) Gate (optional)
     gate_mask = None
     if use_gate:
         X, gate_mask = safe_apply_gate(X, drop_key=drop_key)
 
-    # 3) Align to trained columns
     X = align_features_to_expected(X, expected_cols)
 
-    # 4) Predict
     probs = model.predict_proba(X)[:, 1]
 
-    # 5) Build output
     df_out = df.copy()
     df_out["risk_score"] = probs
     df_out["alarm"] = df_out["risk_score"].apply(lambda s: generate_alarm(s, threshold))
@@ -238,7 +213,7 @@ def compare_drop_types(df_raw: pd.DataFrame, threshold: float, use_gate: bool):
 
 
 # ===============================
-# Main UI
+# Main UI: Input
 # ===============================
 df_input = None
 
@@ -247,7 +222,6 @@ if input_mode == "CSV Upload":
     st.info(t(lang_code,
               "CSV must contain at least: time, MAP, HR, SpO2 (RR optional).",
               "يجب أن يحتوي CSV على الأقل: time, MAP, HR, SpO2 (و RR اختياري)."))
-
     if uploaded_file is not None:
         df_input = pd.read_csv(uploaded_file)
 
@@ -297,6 +271,16 @@ if df_input is None:
 try:
     df_norm = normalize_input_df(df_input)
 
+    # ✅ AUTO classify drop type
+    auto = classify_drop_type(df_norm)
+    auto_key = auto["drop_key"]
+    auto_label = auto["label"]
+    auto_details = auto["details"]
+
+    # choose final drop key
+    drop_key = manual_drop_key if override_drop else auto_key
+    drop_text = {"A": "A: Rapid", "B": "B: Gradual", "C": "C: Intermittent"}.get(drop_key, auto_label)
+
     # Patient info dict for report
     patient_info = {
         "Patient ID": patient_id,
@@ -314,6 +298,14 @@ try:
         chart_cols.append("EtCO2")
     st.line_chart(df_norm[chart_cols])
 
+    # ✅ show auto drop type
+    st.subheader(t(lang_code, "🧩 Auto Drop-Type (A/B/C)", "🧩 تصنيف نوع الهبوط تلقائيًا (A/B/C)"))
+    cA, cB = st.columns([1, 2])
+    cA.metric(t(lang_code, "Auto Drop Type", "النوع التلقائي"), auto_label)
+    with cB:
+        with st.expander(t(lang_code, "Why this type?", "لماذا هذا النوع؟")):
+            st.json(auto_details)
+
     # Inference
     df_out, gate_mask, X = run_inference(df_norm, threshold=threshold, use_gate=use_gate, drop_key=drop_key)
 
@@ -327,9 +319,9 @@ try:
     c1.metric("MAP", f"{latest['MAP']:.1f}")
     c2.metric(t(lang_code, "Risk Score", "درجة الخطر"), f"{latest['risk_score']:.3f}")
     c3.metric(t(lang_code, "Alarm", "إنذار"), "YES 🚨" if latest["alarm"] else "NO ✅")
-    c4.metric(t(lang_code, "Drop Type", "نوع الهبوط"), drop_key)
+    c4.metric(t(lang_code, "Drop Type", "نوع الهبوط"), drop_text)
 
-    # ✅ NEW: Advanced explanation from explain.py (with lang)
+    # Explanation
     st.subheader(t(lang_code, "🧠 Medical Explanation (auto)", "🧠 تفسير طبي (آلي)"))
     exp = build_medical_explanation(
         df_out,
@@ -354,7 +346,7 @@ try:
 
     st.caption(exp["disclaimer"])
 
-    # ✅ NEW: PDF report download (with lang)
+    # PDF
     st.subheader(t(lang_code, "📄 PDF Report", "📄 تقرير PDF"))
     pdf_bytes = generate_pdf_report(
         df_out=df_out,
@@ -372,7 +364,7 @@ try:
         mime="application/pdf"
     )
 
-    # Show expected model columns
+    # expected cols
     with st.expander(t(lang_code, "Show expected model columns", "إظهار أعمدة النموذج المتوقعة")):
         st.write(list(expected_cols))
 
