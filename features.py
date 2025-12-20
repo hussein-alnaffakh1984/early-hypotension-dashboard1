@@ -3,233 +3,208 @@ import numpy as np
 import pandas as pd
 
 
+# ---------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------
 def get_expected_feature_columns(model):
     """
-    Use the model's own expected feature names (most reliable).
+    Use model's expected feature names (best if trained with DataFrame).
     """
     if hasattr(model, "feature_names_in_"):
         return list(model.feature_names_in_)
     # fallback
     return [
         "MAP_filled",
-        "MAP_m30","MAP_m60","MAP_s60","MAP_d1","MAP_d60","MAP_drop_2m",
-        "HR","HR_m30","HR_m60","HR_s60","HR_d1","HR_d60",
-        "SpO2","SpO2_m30","SpO2_m60","SpO2_s60","SpO2_d1","SpO2_d60",
-        "EtCO2","EtCO2_m30","EtCO2_m60","EtCO2_s60","EtCO2_d1","EtCO2_d60",
-        "RR","RR_m30","RR_m60","RR_s60","RR_d1","RR_d60",
+        "MAP_m30", "MAP_m60", "MAP_s60", "MAP_d1", "MAP_d60",
+        "MAP_drop_2m",
+        "HR", "HR_m30", "HR_m60", "HR_s60", "HR_d1", "HR_d60",
+        "SpO2", "SpO2_m30", "SpO2_m60", "SpO2_s60", "SpO2_d1", "SpO2_d60",
+        "EtCO2", "EtCO2_m30", "EtCO2_m60", "EtCO2_s60", "EtCO2_d1", "EtCO2_d60",
+        "RR", "RR_m30", "RR_m60", "RR_s60", "RR_d1", "RR_d60",
     ]
 
 
-def _ensure_time_seconds(df: pd.DataFrame) -> pd.DataFrame:
+def _to_float_time(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Force time column to float64 ALWAYS (to avoid merge_asof dtype mismatch).
+    """
     df = df.copy()
-    if "time" not in df.columns:
-        raise ValueError("CSV must contain 'time' column.")
-    df["time"] = pd.to_numeric(df["time"], errors="coerce")
+    df["time"] = pd.to_numeric(df["time"], errors="coerce").astype(np.float64)
     df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
     return df
 
-import numpy as np
-import pandas as pd
 
-import numpy as np
-import pandas as pd
+def _ensure_optional_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "RR" not in df.columns:
+        df["RR"] = np.nan
+    if "EtCO2" not in df.columns:
+        df["EtCO2"] = np.nan
+    return df
+
 
 def _resample_to_1s(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resample irregular time series to 1-second grid using merge_asof.
+    ✅ IMPORTANT: time will be float64 on both sides.
+    """
     df = df_raw.copy()
-
     if "time" not in df.columns:
         raise ValueError("Missing required column: time")
 
-    # 1) time -> numeric
-    df["time"] = pd.to_numeric(df["time"], errors="coerce")
-    df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    df = _to_float_time(df)
+    df = _ensure_optional_signals(df)
 
-    # 2) ✅ حول الوقت إلى ثواني INT (هذا يحل float/int نهائياً)
-    # إذا الوقت أصلاً بالثواني وفيه كسور، نقرّبه لأقرب ثانية
-    df["time_s"] = np.round(df["time"].astype(float)).astype(np.int64)
+    # Convert to "seconds grid" but KEEP as float for safe merge_asof
+    t_min = int(np.floor(df["time"].min()))
+    t_max = int(np.ceil(df["time"].max()))
+    grid = pd.DataFrame({"time": np.arange(t_min, t_max + 1, 1, dtype=np.int64).astype(np.float64)})
 
-    # 3) إزالة التكرار بنفس الثانية (احتفظ بآخر قراءة)
-    df = df.drop_duplicates(subset=["time_s"], keep="last").reset_index(drop=True)
+    # Remove duplicates by time (keep last)
+    df = df.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
 
-    # 4) شبكة 1 ثانية INT أيضاً
-    t_min = int(df["time_s"].min())
-    t_max = int(df["time_s"].max())
-    grid = pd.DataFrame({"time_s": np.arange(t_min, t_max + 1, 1, dtype=np.int64)})
-
-    # 5) ✅ merge_asof على time_s (int مع int)
-    df2 = pd.merge_asof(
-        grid.sort_values("time_s"),
-        df.sort_values("time_s"),
-        on="time_s",
-        direction="nearest",
-        tolerance=0  # لأن time_s صار integer بالضبط
-    )
-
-    # 6) رجّع عمود time الأصلي (اختياري) أو اصنع time من time_s
-    # نخلي time = time_s حتى يكون واضح أنه بالثواني
-    df2["time"] = df2["time_s"].astype(np.float64)
-
-    # احذف time_s إذا لا تحتاجه
-    # (إذا عندك أجزاء أخرى تعتمد على time_s اتركه)
-    return df2
-
-
-
-
-    grid = pd.DataFrame({"time": np.arange(t0, t1 + 1, 1, dtype=float)})
-
-    # asof merge to nearest previous sample then interpolate
     df2 = pd.merge_asof(
         grid.sort_values("time"),
         df.sort_values("time"),
         on="time",
-        direction="backward",
-        tolerance=10_000  # large tolerance
+        direction="nearest"
     )
-
-    # interpolate for smoother time series
-    for col in ["MAP", "HR", "SpO2", "RR", "EtCO2"]:
-        df2[col] = df2[col].interpolate(limit_direction="both")
-
     return df2
 
 
-def _rolling_feats(s: pd.Series, win: int):
+def _roll_feats(s: pd.Series, win: int):
     """
-    win is in seconds on 1s grid.
+    Rolling mean/std and first difference (slope proxy).
     """
-    m = s.rolling(win, min_periods=max(3, win // 3)).mean()
+    mean = s.rolling(win, min_periods=max(3, win // 3)).mean()
     std = s.rolling(win, min_periods=max(3, win // 3)).std()
-    return m, std
+    d1 = s.diff()
+    dwin = s.diff(win) / max(1, win)
+    return mean, std, d1, dwin
 
 
-def _diff_lag(s: pd.Series, lag: int):
-    """
-    Difference with lag seconds: current - lagged
-    """
-    return s - s.shift(lag)
-
-
-def compute_drop_scores(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Produce per-time scores for Rapid/Gradual/Intermittent patterns.
-    This is used to make A/B/C actually DIFFERENT (AUTO + weighting).
-    """
-    df = _resample_to_1s(df_raw)
-
-    map_f = df["MAP"].ffill().bfill()
-    # rapid: sharp drop over 2 minutes + negative slope
-    drop_2m = (map_f.shift(120) - map_f).clip(lower=0)  # positive when dropping
-    slope_60 = (map_f - map_f.shift(60))  # negative means falling
-
-    rapid_score = (drop_2m / 15.0) + (-slope_60.clip(upper=0) / 10.0)
-
-    # gradual: sustained fall over 60-180 sec (without big abrupt)
-    drop_1m = (map_f.shift(60) - map_f).clip(lower=0)
-    drop_3m = (map_f.shift(180) - map_f).clip(lower=0)
-    gradual_score = (drop_3m / 20.0) + (drop_1m / 15.0) - (drop_2m / 20.0)
-
-    # intermittent: oscillation/instability (variance + sign changes)
-    _, std_60 = _rolling_feats(map_f, 60)
-    d1 = map_f.diff()
-    sign_changes = (np.sign(d1).diff().abs() > 0).astype(float).rolling(60, min_periods=10).mean()
-    intermittent_score = (std_60.fillna(0) / 6.0) + (sign_changes.fillna(0) / 0.25)
-
-    scores = pd.DataFrame({
-        "time": df["time"].values,
-        "score_A_rapid": rapid_score.replace([np.inf, -np.inf], np.nan).fillna(0).values,
-        "score_B_gradual": gradual_score.replace([np.inf, -np.inf], np.nan).fillna(0).values,
-        "score_C_intermittent": intermittent_score.replace([np.inf, -np.inf], np.nan).fillna(0).values,
-    })
-
-    # normalize 0..1 per case
-    for c in ["score_A_rapid", "score_B_gradual", "score_C_intermittent"]:
-        mx = float(scores[c].max()) if len(scores) else 0.0
-        if mx <= 1e-9:
-            scores[c + "_n"] = 0.0
-        else:
-            scores[c + "_n"] = (scores[c] / mx).clip(0, 1)
-
-    # AUTO label per time
-    arr = scores[["score_A_rapid_n", "score_B_gradual_n", "score_C_intermittent_n"]].to_numpy()
-    idx = np.argmax(arr, axis=1)
-    labels = np.array(["A", "B", "C"])[idx]
-    scores["drop_auto"] = labels
-
-    return scores
-
-
+# ---------------------------------------------------------
+# Feature matrix for model
+# ---------------------------------------------------------
 def build_feature_matrix(df_raw: pd.DataFrame, expected_cols: list) -> pd.DataFrame:
     """
-    Build X EXACTLY with the columns the model expects.
-    Uses 1-second resampling and window-based rolling features.
+    Build X that matches EXACTLY columns used in training.
+    Required: time, MAP, HR, SpO2
+    Optional: RR, EtCO2
+    Produces rolling features with same naming you showed earlier.
     """
-    df = _resample_to_1s(df_raw)
+    df = df_raw.copy()
+    df.columns = [c.strip() for c in df.columns]
 
-    # signals
-    MAP = df["MAP"].copy()
-    HR = df["HR"].copy()
-    SpO2 = df["SpO2"].copy()
-    RR = df["RR"].copy()
-    EtCO2 = df["EtCO2"].copy()
+    # Required columns
+    required = ["time", "MAP", "HR", "SpO2"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV must contain: {missing}")
 
-    MAP_filled = MAP.ffill().bfill()
+    df = _to_float_time(df)
+    df = _ensure_optional_signals(df)
 
-    # rolling windows
-    MAP_m30, _ = _rolling_feats(MAP_filled, 30)
-    MAP_m60, MAP_s60 = _rolling_feats(MAP_filled, 60)
-    HR_m30, _ = _rolling_feats(HR, 30)
-    HR_m60, HR_s60 = _rolling_feats(HR, 60)
-    Sp_m30, _ = _rolling_feats(SpO2, 30)
-    Sp_m60, Sp_s60 = _rolling_feats(SpO2, 60)
-    Et_m30, _ = _rolling_feats(EtCO2, 30)
-    Et_m60, Et_s60 = _rolling_feats(EtCO2, 60)
-    RR_m30, _ = _rolling_feats(RR, 30)
-    RR_m60, RR_s60 = _rolling_feats(RR, 60)
+    # Numeric
+    for c in ["MAP", "HR", "SpO2", "RR", "EtCO2"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # diffs
-    MAP_d1 = _diff_lag(MAP_filled, 1)
-    MAP_d60 = _diff_lag(MAP_filled, 60)
-    MAP_drop_2m = (MAP_filled.shift(120) - MAP_filled).clip(lower=0)
+    # MAP_filled like training
+    df["MAP_filled"] = df["MAP"].ffill().bfill()
 
-    HR_d1 = _diff_lag(HR, 1)
-    HR_d60 = _diff_lag(HR, 60)
+    # Use 1-second resampling for stable rolling (optional but recommended)
+    df1 = _resample_to_1s(df[["time", "MAP_filled", "HR", "SpO2", "RR", "EtCO2"]])
 
-    Sp_d1 = _diff_lag(SpO2, 1)
-    Sp_d60 = _diff_lag(SpO2, 60)
+    # Rolling windows (assuming 1s sampling)
+    # m30 = 30s mean, m60=60s mean, s60=60s std, d1=1s diff, d60=60s diff
+    def add_group(prefix: str, col: str):
+        s = df1[col]
+        m30, s30, d1, d30 = _roll_feats(s, 30)
+        m60, s60, d1b, d60 = _roll_feats(s, 60)
+        # Create names consistent with your expected_cols list
+        df1[f"{prefix}_m30"] = m30
+        df1[f"{prefix}_m60"] = m60
+        df1[f"{prefix}_s60"] = s60
+        df1[f"{prefix}_d1"] = d1
+        df1[f"{prefix}_d60"] = s.diff(60)
 
-    Et_d1 = _diff_lag(EtCO2, 1)
-    Et_d60 = _diff_lag(EtCO2, 60)
+    add_group("MAP", "MAP_filled")
+    add_group("HR", "HR")
+    add_group("SpO2", "SpO2")
+    add_group("RR", "RR")
+    add_group("EtCO2", "EtCO2")
 
-    RR_d1 = _diff_lag(RR, 1)
-    RR_d60 = _diff_lag(RR, 60)
+    # Drop feature over 2 minutes (120s)
+    df1["MAP_drop_2m"] = df1["MAP_filled"].shift(120) - df1["MAP_filled"]
 
-    # assemble base df with ALL possible features we might need
-    feat = pd.DataFrame({
-        "MAP_filled": MAP_filled,
-        "MAP_m30": MAP_m30, "MAP_m60": MAP_m60, "MAP_s60": MAP_s60,
-        "MAP_d1": MAP_d1, "MAP_d60": MAP_d60, "MAP_drop_2m": MAP_drop_2m,
+    # Now build X with EXACT expected columns/order
+    X = df1.reindex(columns=list(expected_cols), fill_value=np.nan)
 
-        "HR": HR,
-        "HR_m30": HR_m30, "HR_m60": HR_m60, "HR_s60": HR_s60,
-        "HR_d1": HR_d1, "HR_d60": HR_d60,
+    # Ensure numeric float for sklearn pipeline
+    X = X.apply(pd.to_numeric, errors="coerce").astype(np.float64)
 
-        "SpO2": SpO2,
-        "SpO2_m30": Sp_m30, "SpO2_m60": Sp_m60, "SpO2_s60": Sp_s60,
-        "SpO2_d1": Sp_d1, "SpO2_d60": Sp_d60,
-
-        "EtCO2": EtCO2,
-        "EtCO2_m30": Et_m30, "EtCO2_m60": Et_m60, "EtCO2_s60": Et_s60,
-        "EtCO2_d1": Et_d1, "EtCO2_d60": Et_d60,
-
-        "RR": RR,
-        "RR_m30": RR_m30, "RR_m60": RR_m60, "RR_s60": RR_s60,
-        "RR_d1": RR_d1, "RR_d60": RR_d60,
-    })
-
-    # numeric cleanup
-    feat = feat.replace([np.inf, -np.inf], np.nan)
-
-    # return ONLY expected columns in exact order (missing -> NaN)
-    X = feat.reindex(columns=list(expected_cols), fill_value=np.nan)
     return X
+
+
+# ---------------------------------------------------------
+# Drop-type scoring (A/B/C) for AUTO mode
+# ---------------------------------------------------------
+def compute_drop_scores(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns DataFrame with:
+      time (float64),
+      score_A, score_B, score_C
+    Logic (simple, explainable):
+      A Rapid: big negative slope short-term
+      B Gradual: sustained negative slope longer-term
+      C Intermittent: high variability + repeated drops (std + abs diff)
+    """
+    df = df_raw.copy()
+    df.columns = [c.strip() for c in df.columns]
+    if "time" not in df.columns or "MAP" not in df.columns:
+        raise ValueError("compute_drop_scores needs: time, MAP")
+
+    df = _to_float_time(df)
+    df["MAP"] = pd.to_numeric(df["MAP"], errors="coerce")
+    df["MAP_filled"] = df["MAP"].ffill().bfill()
+
+    # resample to 1s for stable scoring
+    df1 = _resample_to_1s(df[["time", "MAP_filled"]])
+    s = df1["MAP_filled"].astype(np.float64)
+
+    # Slopes
+    slope_10 = (s - s.shift(10)) / 10.0
+    slope_60 = (s - s.shift(60)) / 60.0
+
+    # Variability
+    std_30 = s.rolling(30, min_periods=10).std()
+    absdiff_1 = s.diff().abs().rolling(30, min_periods=10).mean()
+
+    # Scores (normalize-like)
+    score_A = (-slope_10).clip(lower=0)          # rapid drops
+    score_B = (-slope_60).clip(lower=0)          # gradual sustained
+    score_C = (std_30.fillna(0) + absdiff_1.fillna(0))  # intermittent/noisy drops
+
+    out = pd.DataFrame({
+        "time": df1["time"].astype(np.float64),
+        "score_A": score_A.fillna(0).astype(np.float64),
+        "score_B": score_B.fillna(0).astype(np.float64),
+        "score_C": score_C.fillna(0).astype(np.float64),
+    })
+    return out
+
+
+def choose_drop_type(scores_df: pd.DataFrame) -> str:
+    """
+    Pick A/B/C based on average score (can be improved later).
+    """
+    meanA = float(scores_df["score_A"].mean())
+    meanB = float(scores_df["score_B"].mean())
+    meanC = float(scores_df["score_C"].mean())
+
+    m = max(meanA, meanB, meanC)
+    if m == meanA:
+        return "A"
+    if m == meanB:
+        return "B"
+    return "C"
